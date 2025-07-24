@@ -22,3 +22,4 @@ Cargo.lock
 books/hyperactor-book/book/**
 
 CLAUDE.md
+.venv

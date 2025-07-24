@@ -113,12 +113,6 @@ class Clean(Command):
         subprocess.run(["cargo", "clean"])
 
 
-with open("requirements.txt") as f:
-    reqs = f.read()
-
-with open("README.md", encoding="utf8") as f:
-    readme = f.read()
-
 rust_extensions = [
     RustExtension(
         "monarch._rust_bindings",
@@ -140,35 +134,19 @@ if USE_TENSOR_ENGINE:
         )
     )
 
-package_name = os.environ.get("MONARCH_PACKAGE_NAME", "monarch")
 package_version = os.environ.get("MONARCH_VERSION", "0.0.1")
 
 setup(
-    name=package_name,
     version=package_version,
     packages=find_packages(
         where="python",
         exclude=["python/tests.*", "python/tests"],
     ),
     package_dir={"": "python"},
-    python_requires=">= 3.10",
-    install_requires=reqs.strip().split("\n"),
-    license="BSD-3-Clause",
-    author="Meta",
-    author_email="oncall+monarch@xmail.facebook.com",
-    description="Monarch: Single controller library",
-    long_description=readme,
-    long_description_content_type="text/markdown",
     ext_modules=[
         controller_C,
         common_C,
     ],
-    entry_points={
-        "console_scripts": [
-            "monarch=monarch.tools.cli:main",
-            "monarch_bootstrap=monarch._src.actor.bootstrap_main:invoke_main",
-        ],
-    },
     rust_extensions=rust_extensions,
     cmdclass={
         "build_ext": BuildExtension.with_options(no_python_abi_suffix=True),

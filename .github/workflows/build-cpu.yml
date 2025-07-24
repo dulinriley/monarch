@@ -30,4 +30,4 @@ jobs:
         setup_build_environment
 
         # Build monarch (No tensor engine, CPU version)
-        USE_TENSOR_ENGINE=0 python setup.py bdist_wheel
+        USE_TENSOR_ENGINE=0 python -m pip install --no-build-isolation .

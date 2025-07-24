@@ -1,5 +1,49 @@
-[tool.pytest.ini_options]
+[project]
+name = "monarch"
+dynamic = ["version"]
+requires-python = ">= 3.10"
+description = "Monarch: Single controller library"
+readme = { file = "README.md", content-type = "text/markdown" }
+license = "BSD-3-Clause"
+authors = [
+  {name = "Meta", email="oncall+monarch@xmail.facebook.com"},
+]
+dependencies = [
+  "torch",
+  "pyzmq",
+  "requests",
+  "numpy",
+  "pyre-extensions",
+  "cloudpickle",
+  "torchx-nightly",
+  "lark",
+  "tabulate",
+]
 
+[project.entry-points."console_scripts"]
+monarch = "monarch.tools.cli:main"
+monarch_bootstrap = "monarch._src.actor.bootstrap_main:invoke_main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "pytest-timeout",
+  "pytest-asyncio",
+  "pytest-xdist",
+  "pyright",
+]
+
+[build-system]
+requires = [
+  "setuptools",
+  "setuptools-rust",
+  "wheel",
+  "numpy",
+]
+build-backend = "setuptools.build_meta"
+
+
+[tool.pytest.ini_options]
 markers = [
     "oss_skip: marks tests to skip in OSS CI",
 ]

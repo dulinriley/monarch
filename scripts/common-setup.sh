@@ -35,15 +35,10 @@ setup_rust_toolchain() {
     rustup default nightly
 }
 
-install_build_dependencies() {
-    echo "Installing build dependencies..."
-    pip install -r build-requirements.txt ${1:-}
-}
-
 # Install Python test dependencies
 install_python_test_dependencies() {
     echo "Installing test dependencies..."
-    pip install -r python/tests/requirements.txt
+    pip install --no-build-isolation -e '.[dev]'
 }
 
 # Install wheel from artifact directory
@@ -74,7 +69,6 @@ setup_build_environment() {
     setup_conda_environment "${python_version}"
     install_system_dependencies
     setup_rust_toolchain
-    install_build_dependencies "${install_args}"
 }
 
 # Common setup for test workflows (environment only)
