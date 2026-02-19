@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::OnceLock as OnceCell;
 use std::time::Duration;
 
+use hyperactor::ActorId;
 use hyperactor::ActorLocal;
 use hyperactor::ActorRef;
 use hyperactor::PortRef;
@@ -535,12 +536,19 @@ impl<A: Referable> ActorMeshRef<A> {
         }
     }
 
+    /// Query the state of all actors in this mesh.
+    /// If keepalive_owner is Some, use a message that indicates to the recipient
+    /// that the owner of the mesh is still alive. Else, use a normal state
+    /// query.
     #[allow(clippy::result_large_err)]
     pub async fn actor_states(
         &self,
         cx: &impl context::Actor,
+        keepalive_owner: Option<ActorId>,
     ) -> crate::Result<ValueMesh<resource::State<ActorState>>> {
-        self.proc_mesh.actor_states(cx, self.name.clone()).await
+        self.proc_mesh
+            .actor_states(cx, self.name.clone(), keepalive_owner)
+            .await
     }
 
     pub(crate) fn new(

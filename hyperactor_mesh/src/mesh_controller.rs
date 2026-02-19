@@ -710,7 +710,7 @@ impl<A: Referable> Handler<CheckState> for ActorMeshController<A> {
         }
 
         // Now that we know the proc mesh is alive, check for actor state changes.
-        let events = mesh.actor_states(cx).await;
+        let events = mesh.actor_states(cx, Some(cx.self_id().clone())).await;
         if let Err(e) = events {
             send_state_change(
                 cx,

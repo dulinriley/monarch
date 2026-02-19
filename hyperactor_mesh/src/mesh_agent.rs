@@ -15,11 +15,13 @@
 #![allow(unused_assignments)]
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::mem::take;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::RwLockReadGuard;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use enum_as_inner::EnumAsInner;
@@ -53,12 +55,24 @@ use hyperactor::mailbox::MessageEnvelope;
 use hyperactor::mailbox::Undeliverable;
 use hyperactor::proc::Proc;
 use hyperactor::supervision::ActorSupervisionEvent;
+use hyperactor_config::CONFIG;
+use hyperactor_config::ConfigAttr;
+use hyperactor_config::attrs::declare_attrs;
 use serde::Deserialize;
 use serde::Serialize;
 use typeuri::Named;
 
 use crate::Name;
 use crate::resource;
+
+declare_attrs! {
+    /// Whether to self kill actors, procs, and hosts whose owner is not reachable.
+    @meta(CONFIG = ConfigAttr::new(
+        Some("HYPERACTOR_MESH_ORPHAN_TIMEOUT".to_string()),
+        Some("mesh_orphan_timeout".to_string()),
+    ))
+    pub attr MESH_ORPHAN_TIMEOUT: Duration = Duration::from_secs(0);
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Named)]
 pub enum GspawnResult {
@@ -182,6 +196,19 @@ struct ActorInstanceState {
     stopped: bool,
 }
 
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    Named,
+    Bind,
+    Unbind
+)]
+struct SelfCheck {}
+
 /// A mesh agent is responsible for managing procs in a [`ProcMesh`].
 ///
 /// ## Supervision event ingestion (remote)
@@ -211,6 +238,7 @@ struct ActorInstanceState {
         resource::Stop { cast = true },
         resource::StopAll { cast = true },
         resource::GetState<ActorState> { cast = true },
+        resource::KeepaliveGetState<ActorState> { cast = true },
         resource::GetRankStatus { cast = true },
     ]
 )]
@@ -226,6 +254,16 @@ pub struct ProcMeshAgent {
     /// If record_supervision_events is true, then this will contain the list
     /// of all events that were received.
     supervision_events: HashMap<ActorId, Vec<ActorSupervisionEvent>>,
+    /// Track the mesh_controller -> owned actors relationship, along with the
+    /// last time we got a KeepaliveGetState message from that controller.
+    /// Note that this key != keys in supervision_events or actor_states, these
+    /// keys are the controllers. The value ActorIds are the ones in supervision_events.
+    controllers_to_actors:
+        HashMap<ActorId, (tokio::time::Instant, HashSet<ActorId>, HashSet<Name>)>,
+    /// If set, check for periodic GetState messages from the owning controller.
+    /// If messages are not seen within this duration, send a message to owned actors
+    /// to stop.
+    mesh_orphan_timeout: Option<Duration>,
 }
 
 impl ProcMeshAgent {
@@ -247,12 +285,25 @@ impl ProcMeshAgent {
             actor_states: HashMap::new(),
             record_supervision_events: false,
             supervision_events: HashMap::new(),
+            controllers_to_actors: HashMap::new(),
+            // v0 procs don't have an owner they can check for, so they should
+            // never try to kill the children.
+            mesh_orphan_timeout: None,
         };
         let handle = proc.spawn::<Self>("mesh", agent)?;
         Ok((proc, handle))
     }
 
     pub(crate) fn boot_v1(proc: Proc) -> Result<ActorHandle<Self>, anyhow::Error> {
+        // We can't use Option<Duration> directly in config attrs because AttrValue
+        // is not implemented for Option<Duration>. So we use a zero timeout to
+        // indicate no timeout.
+        let orphan_timeout = hyperactor_config::global::get(MESH_ORPHAN_TIMEOUT);
+        let orphan_timeout = if orphan_timeout.is_zero() {
+            None
+        } else {
+            Some(orphan_timeout)
+        };
         let agent = ProcMeshAgent {
             proc: proc.clone(),
             remote: Remote::collect(),
@@ -260,6 +311,8 @@ impl ProcMeshAgent {
             actor_states: HashMap::new(),
             record_supervision_events: true,
             supervision_events: HashMap::new(),
+            controllers_to_actors: HashMap::new(),
+            mesh_orphan_timeout: orphan_timeout,
         };
         proc.spawn::<Self>("agent", agent)
     }
@@ -280,6 +333,9 @@ impl ProcMeshAgent {
 impl Actor for ProcMeshAgent {
     async fn init(&mut self, this: &Instance<Self>) -> Result<(), anyhow::Error> {
         self.proc.set_supervision_coordinator(this.port())?;
+        if let Some(delay) = &self.mesh_orphan_timeout {
+            this.self_message_with_delay(SelfCheck::default(), *delay)?;
+        }
         Ok(())
     }
 
@@ -466,8 +522,9 @@ impl MeshAgentMessageHandler for ProcMeshAgent {
     ) -> Result<StopActorResult, anyhow::Error> {
         tracing::info!(
             name = "StopActor",
-            actor_id = %actor_id,
+            %actor_id,
             actor_name = actor_id.name(),
+            %reason,
         );
 
         if let Some(mut status) = self.proc.stop_actor(&actor_id, reason) {
@@ -672,6 +729,11 @@ impl Handler<resource::Stop> for ProcMeshAgent {
         };
         let timeout = hyperactor_config::global::get(hyperactor::config::STOP_ACTOR_TIMEOUT);
         if let Some(actor_id) = actor_id {
+            // We don't remove this actor from the stale controllers map, because
+            // we may have GetState queries for this actor after it has stopped,
+            // and we don't want to keep inserting.
+            // The orphaned actor SelfCheck will consult the stopped field before
+            // trying to stop any actor again.
             // While this function returns a Result, it never returns an Err
             // value so we can simply expect without any failure handling.
             self.stop_actor(cx, actor_id, timeout.as_millis() as u64, message.reason)
@@ -858,6 +920,44 @@ impl Handler<resource::GetState<ActorState>> for ProcMeshAgent {
     }
 }
 
+#[async_trait]
+impl Handler<resource::KeepaliveGetState<ActorState>> for ProcMeshAgent {
+    async fn handle(
+        &mut self,
+        cx: &Context<Self>,
+        message: resource::KeepaliveGetState<ActorState>,
+    ) -> anyhow::Result<()> {
+        // Same impl as GetState, but additionally register the sender as a controller
+        // and update the last time
+        let instance_state = self
+            .actor_states
+            .get(&message.get_state.name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "attempting to register an owner {} for an actor that doesn't exist: {}",
+                    message.owner,
+                    message.get_state.name
+                )
+            })?;
+        let now = RealClock.now();
+        let entry = self
+            .controllers_to_actors
+            .entry(message.owner)
+            .or_insert_with(|| (now, HashSet::new(), HashSet::new()));
+        // Update the timestamp even if the actor it is querying for never spawned,
+        // there may be other actors it spawns and we don't want them to think the
+        // controller is dead.
+        entry.0 = now;
+        if let Ok(actor_id) = &instance_state.spawn {
+            // It's ok for these to be duplicates.
+            entry.1.insert(actor_id.clone());
+            entry.2.insert(message.get_state.name.clone());
+        }
+        // Forward the rest of the impl to GetState.
+        <Self as Handler<resource::GetState<ActorState>>>::handle(self, cx, message.get_state).await
+    }
+}
+
 /// A local handler to get a new client instance on the proc.
 /// This is used to create root client instances.
 #[derive(Debug, hyperactor::Handler, hyperactor::HandleClient)]
@@ -895,6 +995,85 @@ impl Handler<GetProc> for ProcMeshAgent {
         GetProc { proc }: GetProc,
     ) -> anyhow::Result<()> {
         proc.send(cx, self.proc.clone())?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<SelfCheck> for ProcMeshAgent {
+    async fn handle(&mut self, cx: &Context<Self>, _: SelfCheck) -> anyhow::Result<()> {
+        // Check last time a GetState was received. If one hasn't been received in the timeout
+        // specified, stop the actors it owned.
+        // This allows automatic cleanup in cases where an actor disappears but it owned resources.
+        // We don't want those resources to keep running potentially forever.
+        // It is important that this check runs on the same proc as the child actor itself.
+        // The controller could be dead, or disconnected, and we cannot rely on it to always cleanup
+        // what it created. This way we have bidirectional responsibility:
+        // * If owned goes down / becomes unreachable, owner is notified and can handle it
+        // * If owner goes down / becomes unreachable, owned actors are notified
+        //   and stop themselves (they can't handle it)
+        let duration = if let Some(duration) = &self.mesh_orphan_timeout {
+            *duration
+        } else {
+            return Ok(());
+        };
+        let timeout = hyperactor_config::global::get(hyperactor::config::STOP_ACTOR_TIMEOUT);
+        let now = RealClock.now();
+
+        // Collect stale controllers before mutating, since stop_actor borrows &mut self.
+        let stale: Vec<(ActorId, HashSet<ActorId>, HashSet<Name>)> = self
+            .controllers_to_actors
+            .iter()
+            .filter(|(_, (last_msg, _, _))| now - *last_msg > duration)
+            .map(|(controller, (_, actor_ids, actor_names))| {
+                (controller.clone(), actor_ids.clone(), actor_names.clone())
+            })
+            .collect();
+
+        for (controller, actor_ids, actor_names) in stale {
+            tracing::info!(
+                %controller,
+                "controller has not sent GetState in {:?}, stopping {} owned actors",
+                duration,
+                actor_ids.len(),
+            );
+            self.controllers_to_actors.remove(&controller);
+            for (actor_id, name) in actor_ids.into_iter().zip(actor_names.into_iter()) {
+                let should_stop = match self.actor_states.get_mut(&name) {
+                    // Only stop actors that are still running. An actor is running
+                    // if it was successfully spawned and is not stopped already.
+                    Some(ActorInstanceState {
+                        spawn: Ok(_),
+                        stopped,
+                        ..
+                    }) => {
+                        if *stopped {
+                            false
+                        } else {
+                            *stopped = true;
+                            true
+                        }
+                    }
+                    // If the actor was never spawned we don't need to stop it.
+                    Some(_) | None => false,
+                };
+                if should_stop {
+                    // While this function returns a Result, it never returns an Err
+                    // value so we can simply expect without any failure handling.
+                    self.stop_actor(
+                        cx,
+                        actor_id,
+                        timeout.as_millis() as u64,
+                        "owner unavailable".to_string(),
+                    )
+                    .await
+                    .expect("stop_actor cannot fail");
+                }
+            }
+        }
+
+        // Reschedule.
+        cx.self_message_with_delay(SelfCheck::default(), duration)?;
         Ok(())
     }
 }

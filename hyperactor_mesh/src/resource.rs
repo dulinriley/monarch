@@ -24,6 +24,7 @@ use std::ops::Range;
 use std::time::Duration;
 
 use enum_as_inner::EnumAsInner;
+use hyperactor::ActorId;
 use hyperactor::Bind;
 use hyperactor::HandleClient;
 use hyperactor::Handler;
@@ -350,6 +351,49 @@ where
         Self {
             name: self.name.clone(),
             reply: self.reply.clone(),
+        }
+    }
+}
+
+/// Same as GetState, but additionally tells the receiver that the owner is still alive.
+/// If the receiver does not receive this message for a while, it might assume the owner is dead.
+#[derive(Debug, Serialize, Deserialize, Named, Handler, HandleClient, RefClient)]
+pub struct KeepaliveGetState<S> {
+    pub owner: ActorId,
+    pub get_state: GetState<S>,
+}
+wirevalue::register_type!(KeepaliveGetState<ProcState>);
+wirevalue::register_type!(KeepaliveGetState<ActorState>);
+
+// Cannot derive Bind and Unbind for this generic, implement manually.
+impl<S> Unbind for KeepaliveGetState<S>
+where
+    S: RemoteMessage,
+    S: Unbind,
+{
+    fn unbind(&self, bindings: &mut Bindings) -> anyhow::Result<()> {
+        self.get_state.unbind(bindings)
+    }
+}
+
+impl<S> Bind for KeepaliveGetState<S>
+where
+    S: RemoteMessage,
+    S: Bind,
+{
+    fn bind(&mut self, bindings: &mut Bindings) -> anyhow::Result<()> {
+        self.get_state.bind(bindings)
+    }
+}
+
+impl<S> Clone for KeepaliveGetState<S>
+where
+    S: RemoteMessage,
+{
+    fn clone(&self) -> Self {
+        Self {
+            owner: self.owner.clone(),
+            get_state: self.get_state.clone(),
         }
     }
 }
