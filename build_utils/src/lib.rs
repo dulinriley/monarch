@@ -419,7 +419,7 @@ pub fn setup_cpp_static_libs() -> CppStaticLibsConfig {
 /// since BUCK handles library paths differently.
 pub fn set_python_rpath() {
     // pyo3-build-config is only available in OSS builds (Cargo), not in BUCK builds
-    #[cfg(not(fbcode_build))]
+    #[cfg(all(not(fbcode_build), feature = "resolve-config"))]
     {
         let python_config = pyo3_build_config::get();
 

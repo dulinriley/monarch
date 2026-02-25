@@ -17,6 +17,11 @@ fn main() {}
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
+    if std::env::var("CARGO_FEATURE_TENSOR_ENGINE").is_err() {
+        // Do not build this module if the "tensor-engine" feature is not enabled.
+        return;
+    }
+
     // Set up Python rpath for runtime linking
     build_utils::set_python_rpath();
 

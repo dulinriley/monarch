@@ -15,6 +15,10 @@ fn main() {}
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
+    if env::var("CARGO_FEATURE_TENSOR_ENGINE").is_err() {
+        // Do not build this module if the "tensor-engine" feature is not enabled.
+        return;
+    }
     // Get rdma-core config from cpp_static_libs (includes are used, links emitted by monarch_extension)
     let cpp_static_libs_config = build_utils::CppStaticLibsConfig::from_env();
     let rdma_include = &cpp_static_libs_config.rdma_include_dir;
