@@ -24,6 +24,8 @@ Cargo.lock
 books/hyperactor-book/book/**
 
 # CLAUDE.md
+.gemini/**
+GEMINI.md
 
 # macOS files
 */.DS_Store
@@ -37,3 +39,4 @@ docs/**/generated/**
 */sg_execution_times.rst
 
 .venv/**
+.vscode/**
