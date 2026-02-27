@@ -8,6 +8,7 @@
 
 import dataclasses
 import logging
+from pathlib import Path
 import sys
 import textwrap
 from typing import Any, Dict, List
@@ -77,6 +78,51 @@ class ImageSpec:
     """Optional K8s resource requests/limits (e.g. ``{"nvidia.com/gpu": 4}``)."""
 
 
+@dataclasses.dataclass(frozen=True)
+class KubeConfig:
+    """Kubernetes configuration for connecting to the cluster.
+
+    Use this to specify a kubeconfig file for out-of-cluster usage of
+    KubernetesJob::
+
+        KubeConfig(kubeconfig="/path/to/kubeconfig")
+
+    If both local and remote are none, in-cluster configuration is used.
+    """
+
+    local: Path | None = None
+    remote: client.Configuration | None = None
+
+    @classmethod
+    def from_path(cls, path: str) -> "KubeConfig":
+        """Create a KubeConfig from a local file path."""
+        return cls(local=Path(path))
+
+    @classmethod
+    def from_config(cls, config: client.Configuration) -> "KubeConfig":
+        """Create a KubeConfig from a remote host"""
+        return cls(remote=config)
+
+    def load(self):
+        if self.local is not None:
+            try:
+                config.load_kube_config(config_file=str(self.local))
+            except config.ConfigException as e:
+                raise RuntimeError(
+                    f"Failed to load kubeconfig file '{self.local}'"
+                ) from e
+        elif self.remote is not None:
+            client.Configuration.set_default(self.remote)
+        else:
+            try:
+                config.load_incluster_config()
+            except config.ConfigException as e:
+                raise RuntimeError(
+                    "Failed to load in-cluster Kubernetes config. "
+                    "KubernetesJob must run inside a Kubernetes cluster."
+                ) from e
+
+
 class KubernetesJob(JobTrait):
     """
     Job implementation for Kubernetes that discovers and connects to pods.
@@ -101,6 +147,7 @@ class KubernetesJob(JobTrait):
         self,
         namespace: str,
         timeout: int | None = None,
+        kubeconfig: KubeConfig | None = None,
     ) -> None:
         """
         Initialize a KubernetesJob.
@@ -108,10 +155,12 @@ class KubernetesJob(JobTrait):
         Args:
             namespace: Kubernetes namespace for all meshes
             timeout: Maximum seconds to wait for pods to be ready for each mesh (default: None, wait indefinitely)
+            kubeconfig: Path to a kubeconfig file for out-of-cluster configuration (default: None, use in-cluster config)
         """
         configure(default_transport=ChannelTransport.TcpWithHostname)
         self._namespace = namespace
         self._timeout = timeout
+        self._kubeconfig = kubeconfig if kubeconfig is not None else KubeConfig()
         self._meshes: Dict[str, Dict[str, Any]] = {}
         super().__init__()
 
@@ -225,17 +274,10 @@ class KubernetesJob(JobTrait):
         if not provisioned:
             return
 
-        # TODO: Add support for out-of-cluster config
-        try:
-            config.load_incluster_config()
-        except config.ConfigException as e:
-            raise RuntimeError(
-                "Failed to load in-cluster Kubernetes config. "
-                "KubernetesJob must run inside a Kubernetes cluster."
-            ) from e
+        self._kubeconfig.load()
 
-        api = client.CustomObjectsApi()
         api_client = client.ApiClient()
+        api = client.CustomObjectsApi(api_client)
 
         for mesh_name, mesh_config in provisioned.items():
             pod_spec_dict = api_client.sanitize_for_serialization(
@@ -395,18 +437,13 @@ class KubernetesJob(JobTrait):
         """
         ready_pods_by_rank: Dict[int, tuple[str, int]] = {}
 
-        # Load in-cluster Kubernetes configuration
-        try:
-            config.load_incluster_config()
-        except config.ConfigException as e:
-            raise RuntimeError(
-                "Failed to load in-cluster Kubernetes config. "
-                "KubernetesJob must run inside a Kubernetes cluster."
-            ) from e
+        # Load Kubernetes configuration
+        self._kubeconfig.load()
 
         c = client.CoreV1Api()
         w = watch.Watch()
 
+        logger.info("beginning to watch for pods with selector '%s'", label_selector)
         try:
             for event in w.stream(
                 c.list_namespaced_pod,
@@ -425,6 +462,9 @@ class KubernetesJob(JobTrait):
                 try:
                     pod_rank = self._get_pod_rank(pod, pod_rank_label)
                 except ValueError:
+                    logger.warning(
+                        f"Skipping pod {pod.metadata.name} due to missing or invalid pod rank label '{pod_rank_label}'"
+                    )
                     continue
 
                 # Skip pods outside expected range
@@ -437,6 +477,7 @@ class KubernetesJob(JobTrait):
                 # Handle DELETED events
                 if event_type == "DELETED":
                     ready_pods_by_rank.pop(pod_rank, None)
+                    logger.info("Pod '%s' deleted, removed rank %d from ready pods", pod.metadata.name, pod_rank)
                     continue
 
                 # Only process ADDED/MODIFIED events from here
@@ -445,6 +486,7 @@ class KubernetesJob(JobTrait):
 
                 # Update ready pods based on current state
                 if self._is_pod_worker_ready(pod):
+                    logger.info("Pod '%s' is ready with rank %d", pod.metadata.name, pod_rank)
                     ready_pods_by_rank[pod_rank] = (
                         pod.status.pod_ip,
                         self._discover_monarch_port(pod),
@@ -452,11 +494,14 @@ class KubernetesJob(JobTrait):
 
                     # Check if we have all required ranks (0 to num_replicas-1)
                     if len(ready_pods_by_rank) == num_replicas:
+                        # TODO: if out of cluster, use a single host that has exposed an IP + port.
+                        # This will then forward messages to the actual hosts.
                         return [
                             ready_pods_by_rank[rank] for rank in range(num_replicas)
                         ]
                 else:
                     # Pod is no longer ready, remove its rank
+                    logger.info("Pod '%s' is not ready with rank %d", pod.metadata.name, pod_rank)
                     ready_pods_by_rank.pop(pod_rank, None)
 
             # Watch ended without finding all required ranks
