@@ -13,6 +13,10 @@ fn main() {}
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
+    if std::env::var("CARGO_FEATURE_TENSOR_ENGINE").is_err() {
+        // Do not build this module if the "tensor-engine" feature is not enabled.
+        return;
+    }
     // Compile the bridge.cpp file
     let mut cc_builder = cc::Build::new();
     cc_builder

@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#![cfg(feature = "tensor_engine")]
+
 /// A companion to the `torch-sys` crate that provides bindings for
 /// CUDA-specific functionality from libtorch. This crate is separated out to
 /// make it easier for clients who want to avoid compiling CUDA code.

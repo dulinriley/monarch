@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#![cfg(feature = "tensor_engine")]
 #![feature(assert_matches)]
 
 pub mod client;

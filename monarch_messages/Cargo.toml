@@ -26,3 +26,6 @@ wirevalue = { version = "0.0.0", path = "../wirevalue" }
 
 [build-dependencies]
 build_utils = { path = "../build_utils" }
+
+[feature]
+tensor_engine = ["dep:torch-sys-cuda", "dep:torch-sys2"]

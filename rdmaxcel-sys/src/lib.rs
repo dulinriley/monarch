@@ -9,6 +9,8 @@
 // sections of code adapted from https://github.com/jonhoo/rust-ibverbs
 // Copyright (c) 2016 Jon Gjengset under MIT License (MIT)
 
+#![cfg(feature = "tensor_engine")]
+
 mod inner {
     #![allow(non_upper_case_globals)]
     #![allow(non_camel_case_types)]

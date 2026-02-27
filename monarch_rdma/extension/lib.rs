@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#![cfg(feature = "tensor_engine")]
 #![allow(unsafe_op_in_unsafe_fn)]
 use std::ops::Deref;
 use std::sync::Arc;
