@@ -27,8 +27,8 @@ function topY(node: DagNode): number {
 
 /**
  * Renders an SVG path between two nodes.
- * Hierarchy edges: solid gray curves exiting downward.
- * Message edges: dashed, colored arcs below the actor row.
+ * Hierarchy edges: solid gray straight lines.
+ * Message edges: dashed, colored, curved.
  */
 export function DagEdgeComponent({ edge, nodes }: DagEdgeProps) {
   const source = nodes.get(edge.sourceId);
@@ -51,14 +51,21 @@ export function DagEdgeComponent({ edge, nodes }: DagEdgeProps) {
     // Message: smooth rounded arc below the actor row.
     const dx = target.x - source.x;
     const dy = target.y - source.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
     const angle = Math.atan2(dy, dx);
     const sx = source.x + Math.cos(angle) * source.radius;
     const sy = source.y + Math.sin(angle) * source.radius;
     const tx = target.x - Math.cos(angle) * target.radius;
     const ty = target.y - Math.sin(angle) * target.radius;
-    const sag = Math.max(40, Math.abs(dx) * 0.35);
-    const belowY = Math.max(sy, ty) + sag;
-    return `M ${sx} ${sy} Q ${(sx + tx) / 2} ${belowY}, ${tx} ${ty}`;
+
+    if (isMessage) {
+      // Curved path for message edges.
+      const cx = dist * 0.35;
+      return `M ${sx} ${sy} C ${sx + cx} ${sy}, ${tx - cx} ${ty}, ${tx} ${ty}`;
+    }
+
+    // Straight line for hierarchy edges.
+    return `M ${sx} ${sy} L ${tx} ${ty}`;
   }, [source, target, isMessage]);
 
   if (isMessage) {

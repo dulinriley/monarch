@@ -8,7 +8,7 @@
 
 import React, { useState, useRef, useCallback, useMemo, useEffect } from "react";
 import { useApi } from "../hooks/useApi";
-import { computeLayout, ApiDagData, DagNode, DagGraph, TIER_Y, TIER_LABELS, DagTier } from "../utils/dagLayout";
+import { computeLayout, DagNode, DagGraph, TIER_Y, TIER_LABELS, DagTier } from "../utils/dagLayout";
 import { DagNodeComponent } from "./DagNode";
 import { DagEdgeComponent } from "./DagEdge";
 import { DagLegend } from "./DagLegend";
@@ -46,7 +46,12 @@ export function DagView() {
   useEffect(() => {
     if (graph && !viewInitialized.current) {
       viewInitialized.current = true;
-      setViewBox({ x: -20, y: -20, w: graph.width + 40, h: Math.min(graph.height + 40, 800) });
+      setViewBox({
+        x: -20,
+        y: -20,
+        w: Math.min(graph.width + 40, 1200),
+        h: graph.height + 40,
+      });
     }
   }, [graph]);
 
@@ -122,6 +127,8 @@ export function DagView() {
 
   const hierEdges = graph.edges.filter((e) => e.type === "hierarchy");
   const msgEdges = graph.edges.filter((e) => e.type === "message");
+
+  // Tier labels for the 6 rows.
   const tierEntries = Object.entries(TIER_LABELS) as Array<[DagTier, string]>;
 
   return (
@@ -147,9 +154,31 @@ export function DagView() {
               <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
             </filter>
           </defs>
-          <rect x={viewBox.x - 1000} y={viewBox.y - 1000} width={viewBox.w + 2000} height={viewBox.h + 2000} fill="url(#dag-grid)" />
+
+          {/* Background grid */}
+          <rect
+            x={viewBox.x - 1000}
+            y={viewBox.y - 1000}
+            width={viewBox.w + 2000}
+            height={viewBox.h + 2000}
+            fill="url(#dag-grid)"
+          />
+
+          {/* Tier labels — left margin, aligned with tier rows */}
           {tierEntries.map(([tier, label]) => (
-            <text key={tier} x={15} y={TIER_Y[tier]} textAnchor="start" dominantBaseline="middle" fill="var(--text-muted)" fontSize="10" fontFamily="var(--font-display)" opacity="0.5">{label}</text>
+            <text
+              key={tier}
+              x={15}
+              y={TIER_Y[tier]}
+              textAnchor="start"
+              dominantBaseline="middle"
+              fill="var(--text-muted)"
+              fontSize="10"
+              fontFamily="var(--font-display)"
+              opacity="0.5"
+            >
+              {label}
+            </text>
           ))}
           <g className="dag-edges-hierarchy">{hierEdges.map((e) => <DagEdgeComponent key={e.id} edge={e} nodes={nodeMap} />)}</g>
           <g className="dag-edges-messages">{msgEdges.map((e) => <DagEdgeComponent key={e.id} edge={e} nodes={nodeMap} />)}</g>
