@@ -42,7 +42,7 @@ function dashArray(status: string): string | undefined {
 }
 
 /** Mesh tiers render as rounded rectangles; others as circles. */
-const RECT_TIERS = new Set(["host_mesh", "proc_mesh", "actor_mesh"]);
+const RECT_TIERS = new Set(["mesh", "proc_mesh", "actor_mesh"]);
 
 /** Single node rendered as an SVG group. */
 export function DagNodeComponent({
@@ -147,8 +147,8 @@ export function DagNodeComponent({
       {/* Status dot at top-right (hidden for neutral n/a nodes) */}
       {node.status !== "n/a" && (
         <circle
-          cx={r * 0.65}
-          cy={-r * 0.65}
+          cx={isRect ? w / 2 - 4 : r * 0.65}
+          cy={isRect ? -h / 2 + 4 : -r * 0.65}
           r={4}
           fill={color}
           className={
