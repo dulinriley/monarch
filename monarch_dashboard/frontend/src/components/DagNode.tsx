@@ -147,8 +147,8 @@ export function DagNodeComponent({
       {/* Status dot at top-right (hidden for neutral n/a nodes) */}
       {node.status !== "n/a" && (
         <circle
-          cx={isRect ? w / 2 - 4 : r * 0.65}
-          cy={isRect ? -h / 2 + 4 : -r * 0.65}
+          cx={r * 0.65}
+          cy={-r * 0.65}
           r={4}
           fill={color}
           className={
