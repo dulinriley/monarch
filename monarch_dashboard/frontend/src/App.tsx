@@ -30,46 +30,9 @@ const MESH_COLUMNS = [
 
 const AGENT_COLUMNS = [
   { key: "full_name", label: "Name" },
-  { key: "mesh_class", label: "Class" },
   { key: "rank", label: "Rank" },
   { key: "latest_status", label: "Status" },
 ];
-
-const ACTOR_COLUMNS = [
-  { key: "full_name", label: "Name" },
-  { key: "rank", label: "Rank" },
-  { key: "latest_status", label: "Status" },
-  { key: "status_timestamp_us", label: "Last Updated" },
-];
-
-/** Navigation graph: for each level, what comes next and how to label it. */
-const LEVELS: Partial<Record<NavItem["level"], {
-  next: NavItem["level"];
-  label: (row: any) => string;
-  idField: "meshId" | "actorId";
-  idKey: string;
-}>> = {
-  host_meshes:  { next: "host_units",   label: (r) => r.given_name,                              idField: "meshId",  idKey: "id" },
-  host_units:   { next: "proc_meshes",  label: (r) => r.mesh_name ?? "Host",                       idField: "meshId",  idKey: "mesh_id" },
-  proc_meshes:  { next: "proc_units",   label: (r) => r.given_name,                              idField: "meshId",  idKey: "id" },
-  proc_units:   { next: "actor_meshes", label: (r) => r.mesh_name ?? "Proc",                     idField: "meshId",  idKey: "mesh_id" },
-  actor_meshes: { next: "actors",       label: (r) => r.given_name,                              idField: "meshId",  idKey: "id" },
-  actors:       { next: "actor_detail", label: (r) => r.full_name?.split("/").pop() ?? "Actor",  idField: "actorId", idKey: "id" },
-};
-
-/** MeshTable config per hierarchy level. */
-const LEVEL_CONFIG: Partial<Record<NavItem["level"], {
-  apiPath: (n: NavItem) => string;
-  columns: Array<{ key: string; label: string }>;
-  title: string;
-}>> = {
-  host_meshes:  { apiPath: ()  => "/meshes?class=Host",            columns: MESH_COLUMNS,  title: "Host Meshes" },
-  host_units:   { apiPath: (n) => `/actors?mesh_id=${n.meshId}`,   columns: AGENT_COLUMNS, title: "Host Units" },
-  proc_meshes:  { apiPath: (n) => `/meshes/${n.meshId}/children`,  columns: MESH_COLUMNS,  title: "Proc Meshes" },
-  proc_units:   { apiPath: (n) => `/actors?mesh_id=${n.meshId}`,   columns: AGENT_COLUMNS, title: "Proc Units" },
-  actor_meshes: { apiPath: (n) => `/meshes/${n.meshId}/children`,  columns: MESH_COLUMNS,  title: "Actor Meshes" },
-  actors:       { apiPath: (n) => `/actors?mesh_id=${n.meshId}`,   columns: ACTOR_COLUMNS, title: "Actors" },
-};
 
 function App() {
   const [activeTab, setActiveTab] = useState("summary");
@@ -94,12 +57,67 @@ function App() {
       const cfg = LEVELS[currentNav.level];
       if (!cfg) return;
       pushNav({
-        label: cfg.label(entity),
-        level: cfg.next,
-        [cfg.idField]: entity[cfg.idKey],
-      } as NavItem);
+        label: mesh.given_name,
+        level: "host_units",
+        meshId: mesh.id,
+      });
     },
-    [currentNav.level, pushNav]
+    [pushNav]
+  );
+
+  const handleHostUnitClick = useCallback(
+    (agent: any) => {
+      pushNav({
+        label: agent.full_name.split("/").pop() ?? "Host",
+        level: "proc_meshes",
+        meshId: agent.mesh_id,
+      });
+    },
+    [pushNav]
+  );
+
+  const handleProcMeshClick = useCallback(
+    (mesh: any) => {
+      pushNav({
+        label: mesh.given_name,
+        level: "proc_units",
+        meshId: mesh.id,
+      });
+    },
+    [pushNav]
+  );
+
+  const handleProcUnitClick = useCallback(
+    (agent: any) => {
+      pushNav({
+        label: agent.full_name.split("/").pop() ?? "Proc",
+        level: "actor_meshes",
+        meshId: agent.mesh_id,
+      });
+    },
+    [pushNav]
+  );
+
+  const handleActorMeshClick = useCallback(
+    (mesh: any) => {
+      pushNav({
+        label: mesh.given_name,
+        level: "actors",
+        meshId: mesh.id,
+      });
+    },
+    [pushNav]
+  );
+
+  const handleActorClick = useCallback(
+    (actor: any) => {
+      pushNav({
+        label: actor.full_name.split("/").pop() ?? `Actor #${actor.id}`,
+        level: "actor_detail",
+        actorId: actor.id,
+      });
+    },
+    [pushNav]
   );
 
   const handleTabChange = useCallback((id: string) => {
@@ -108,16 +126,63 @@ function App() {
   }, []);
 
   const renderHierarchyView = () => {
-    const cfg = LEVEL_CONFIG[currentNav.level];
-    if (cfg) {
-      return (
-        <MeshTable
-          apiPath={cfg.apiPath(currentNav)}
-          columns={cfg.columns}
-          onRowClick={handleRowClick}
-          title={cfg.title}
-        />
-      );
+    switch (currentNav.level) {
+      case "host_meshes":
+        return (
+          <MeshTable
+            apiPath="/meshes?class=Host"
+            columns={MESH_COLUMNS}
+            onRowClick={handleHostMeshClick}
+            title="Host Meshes"
+          />
+        );
+      case "host_units":
+        return (
+          <MeshTable
+            apiPath={`/actors?mesh_id=${currentNav.meshId}`}
+            columns={AGENT_COLUMNS}
+            onRowClick={handleHostUnitClick}
+            title="Host Units"
+          />
+        );
+      case "proc_meshes":
+        return (
+          <MeshTable
+            apiPath={`/meshes/${currentNav.meshId}/children`}
+            columns={MESH_COLUMNS}
+            onRowClick={handleProcMeshClick}
+            title="Proc Meshes"
+          />
+        );
+      case "proc_units":
+        return (
+          <MeshTable
+            apiPath={`/actors?mesh_id=${currentNav.meshId}`}
+            columns={AGENT_COLUMNS}
+            onRowClick={handleProcUnitClick}
+            title="Proc Units"
+          />
+        );
+      case "actor_meshes":
+        return (
+          <MeshTable
+            apiPath={`/meshes/${currentNav.meshId}/children`}
+            columns={MESH_COLUMNS}
+            onRowClick={handleActorMeshClick}
+            title="Actor Meshes"
+          />
+        );
+      case "actors":
+        return (
+          <ActorTable
+            meshId={currentNav.meshId!}
+            onActorClick={handleActorClick}
+          />
+        );
+      case "actor_detail":
+        return <ActorDetail actorId={currentNav.actorId!} />;
+      default:
+        return null;
     }
     if (currentNav.level === "actor_detail") {
       return <ActorDetail actorId={currentNav.actorId!} />;
