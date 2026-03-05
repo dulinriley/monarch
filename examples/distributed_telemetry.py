@@ -381,22 +381,14 @@ def run_queries(engine, summary: bool = False) -> None:
         print()
 
 
-def run_workload(job, summary=False):
-    """Run the full telemetry demo: spawn actors, run work, query, and shut down.
+def run_workload(procs, engine, summary=False, spawn_child=None):
+    """Shared workload: spawn actors, run work, and query.
 
     Args:
-        job: JobTrait whose state has a "workers" HostMesh.
+        procs: The proc mesh to spawn actors on.
+        engine: The QueryEngine returned by start_telemetry().
         summary: If True, print summary output instead of full tables.
     """
-    print("=" * 50)
-    print()
-
-    engine = start_telemetry()
-
-    hosts = job.state(cached_path=None).hosts
-
-    procs = hosts.spawn_procs(per_host={"workers": 2}, name="workers")
-
     print("Spawning compute actors...")
     # pyre-ignore[29]: procs is a ProcMesh
     actors = procs.spawn("compute", ComputeActor)
@@ -413,16 +405,15 @@ def run_workload(job, summary=False):
 
     print("Spawning sender actor for actor-to-actor messaging...")
     # pyre-ignore[29]: procs is a ProcMesh
-    sender = procs.slice(hosts=0, workers=0).spawn("sender", SenderActor)
+    sender = procs.slice(workers=0).spawn("sender", SenderActor)
 
     print("Sending from sender actor to compute actors...")
     # pyre-ignore[29]: sender is an ActorMesh
     result = sender.send_compute.call_one(actors, 42).get()
     print(f"Sender-to-compute result: {result}")
 
-    print("Spawning a child process...")
-    # pyre-ignore[29]: actors is an ActorMesh
-    actors.slice(hosts=0, workers=0).spawn_child_work.call_one().get()
+    if spawn_child is not None:
+        spawn_child(actors)
 
     # Give a moment for all trace events to be flushed
     print("Waiting for trace events to flush...")
@@ -441,10 +432,28 @@ def run_workload(job, summary=False):
 
 
 def main(summary: bool = False) -> None:
-    run_workload(
-        ProcessJob({"hosts": 2}),
-        summary,
-    )
+    print("Distributed Telemetry - Real Tracing Data Demo")
+    print("=" * 50)
+    print()
+
+    engine = start_telemetry()
+
+    # Spawn worker processes - telemetry automatically tracks them
+    print(f"Spawning {NUM_WORKERS} worker processes...")
+    hosts = ProcessJob({"hosts": 1}).state(cached_path=None).hosts
+    procs = hosts.spawn_procs(per_host={"workers": NUM_WORKERS}, name="workers")
+
+    def spawn_child(_actors):
+        print("Spawning a child process...")
+        child_procs = hosts.spawn_procs(name="child_worker")
+        child_actors = child_procs.spawn("child_compute", ComputeActor)
+        # pyre-ignore[29]: child_actors is an ActorMesh
+        child_actors.compute.call(100).get()
+
+    run_workload(procs, engine, summary, spawn_child=spawn_child)
+
+    # Clean up
+    hosts.shutdown().get()
 
 
 if __name__ == "__main__":
