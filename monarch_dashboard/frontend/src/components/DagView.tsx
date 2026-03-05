@@ -7,6 +7,7 @@
  */
 
 import React, { useState, useRef, useCallback, useMemo, useEffect } from "react";
+import { Mesh, Actor, Message } from "../types";
 import { useApi } from "../hooks/useApi";
 import { computeLayout, DagNode, DagGraph, TIER_Y, TIER_LABELS, DagTier } from "../utils/dagLayout";
 import { DagNodeComponent } from "./DagNode";
@@ -28,8 +29,12 @@ interface Tooltip {
  * computeLayout to assign X/Y positions for SVG rendering.
  */
 export function DagView() {
-  const { data: dagData, loading } = useApi<ApiDagData>("/dag");
+  // Fetch all data needed for the graph.
+  const { data: meshes, loading: meshLoading } = useApi<Mesh[]>("/meshes");
+  const { data: actors, loading: aLoading } = useApi<Actor[]>("/actors");
+  const { data: messages, loading: msgLoading } = useApi<Message[]>("/messages");
 
+  // UI state.
   const [selectedNode, setSelectedNode] = useState<DagNode | null>(null);
   const [tooltip, setTooltip] = useState<Tooltip | null>(null);
   const [viewBox, setViewBox] = useState({ x: 0, y: 0, w: 1300, h: 800 });
@@ -42,6 +47,22 @@ export function DagView() {
     return computeLayout(dagData);
   }, [dagData]);
 
+    const messagePairs: Array<[number, number]> = (messages ?? []).map((m) => [
+      m.from_actor_id,
+      m.to_actor_id,
+    ]);
+
+    // Build actor id -> status map from the list endpoint (which now
+    // includes latest_status via the server-side JOIN in db.py).
+    const actorStatuses: Record<number, string> = {};
+    for (const a of actors) {
+      actorStatuses[a.id] = a.latest_status?.toLowerCase() ?? "unknown";
+    }
+
+    return computeLayout(meshes, actors, actorStatuses, messagePairs);
+  }, [meshes, actors, messages]);
+
+  // Set initial view on first load only — don't reset on data refresh.
   const viewInitialized = useRef(false);
   useEffect(() => {
     if (graph && !viewInitialized.current) {
