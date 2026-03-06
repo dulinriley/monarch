@@ -845,12 +845,6 @@ impl MeshAdminAgent {
             .values()
             .map(|agent| HostId(agent.actor_id().clone()).to_string())
             .collect();
-        // Standalone procs are visible at root level but not hidden
-        // as system — procs are never system, only actors are.
-        for actor_id in self.standalone_proc_actors() {
-            let proc_ref = actor_id.proc_id().to_string();
-            children.push(proc_ref);
-        }
         let system_children: Vec<String> = Vec::new();
         NodePayload {
             identity: "root".to_string(),
@@ -2150,8 +2144,6 @@ mod tests {
         let actor_id1 = ActorId::root(proc1, "mesh_agent".to_string());
         let ref1: ActorRef<HostAgent> = ActorRef::attest(actor_id1.clone());
 
-        // The root client now lives on the Host's "local" proc, not a
-        // standalone "mesh_root_client_proc". Using "local" here to match.
         let client_proc_id = ProcId(ChannelAddr::Tcp(addr1), "local".to_string());
         let client_actor_id = client_proc_id.actor_id("client", 0);
 
