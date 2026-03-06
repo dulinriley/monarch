@@ -845,6 +845,12 @@ impl MeshAdminAgent {
             .values()
             .map(|agent| HostId(agent.actor_id().clone()).to_string())
             .collect();
+        // Standalone procs are visible at root level but not hidden
+        // as system — procs are never system, only actors are.
+        for actor_id in self.standalone_proc_actors() {
+            let proc_ref = actor_id.proc_id().to_string();
+            children.push(proc_ref);
+        }
         let system_children: Vec<String> = Vec::new();
         NodePayload {
             identity: "root".to_string(),
@@ -1073,6 +1079,9 @@ impl MeshAdminAgent {
         };
 
         let proc_name = proc_id.name().to_string();
+
+        // Procs are never system.
+        let is_system = false;
 
         Ok(NodePayload {
             identity: proc_id.to_string(),
@@ -1954,11 +1963,14 @@ mod tests {
             .await
             .unwrap();
         let proc_node = proc_resp.0.unwrap();
-        assert!(
-            matches!(proc_node.properties, NodeProperties::Proc { .. }),
-            "expected Proc properties, got {:?}",
-            proc_node.properties
-        );
+        if let NodeProperties::Proc { is_system, .. } = &proc_node.properties {
+            assert!(
+                !is_system,
+                "procs are never system; is_system should be false"
+            );
+        } else {
+            panic!("expected Proc properties, got {:?}", proc_node.properties);
+        }
         assert_eq!(proc_node.parent, Some(host_child_ref_str.clone()));
         // The system proc should have at least the "host_agent" actor.
         assert!(
@@ -1999,12 +2011,13 @@ mod tests {
         );
     }
 
-    // Verifies MeshAdminAgent::resolve returns NodeProperties::Proc
-    // for all proc children. Spawns a user proc via
+    // Verifies MeshAdminAgent::resolve correctly sets
+    // NodeProperties::Proc.is_system=false for all procs. Procs are
+    // never system; only actors can be. Spawns a user proc via
     // CreateOrUpdate<ProcSpec>, resolves all host proc-children, and
-    // asserts every proc returns Proc properties.
+    // asserts every proc reports is_system=false.
     #[tokio::test]
-    async fn test_proc_properties_for_all_procs() {
+    async fn test_is_system_flag_false_for_all_procs() {
         use std::time::Duration;
 
         use hyperactor::Proc;
@@ -2100,7 +2113,17 @@ mod tests {
                 .await
                 .unwrap();
             let node = resp.0.unwrap();
-            if let NodeProperties::Proc { proc_name, .. } = &node.properties {
+            if let NodeProperties::Proc {
+                is_system,
+                proc_name,
+                ..
+            } = &node.properties
+            {
+                assert!(
+                    !is_system,
+                    "proc '{}' should have is_system=false; procs are never system",
+                    proc_name
+                );
                 if proc_name.contains(&user_proc_name_str) {
                     found_user = true;
                 } else {
@@ -2127,6 +2150,8 @@ mod tests {
         let actor_id1 = ActorId::root(proc1, "mesh_agent".to_string());
         let ref1: ActorRef<HostAgent> = ActorRef::attest(actor_id1.clone());
 
+        // The root client now lives on the Host's "local" proc, not a
+        // standalone "mesh_root_client_proc". Using "local" here to match.
         let client_proc_id = ProcId(ChannelAddr::Tcp(addr1), "local".to_string());
         let client_actor_id = client_proc_id.actor_id("client", 0);
 
@@ -2417,7 +2442,7 @@ mod tests {
     //
     // 1. The identity of the resolved system proc matches the plain
     //    ProcId reference from the host's system_children list.
-    // 2. The properties are NodeProperties::Proc.
+    // 2. The properties are NodeProperties::Proc with is_system=false.
     // 3. The parent is set to the HostId format ("host:<actor_id>").
     // 4. The as_of field is present and non-empty.
     #[tokio::test]
@@ -2505,7 +2530,7 @@ mod tests {
             expected_system_ref
         );
 
-        // -- 7. Resolve a proc child and verify it has Proc properties --
+        // -- 7. Resolve a proc child and verify is_system=false --
         let proc_child_ref = &host_node.children[0];
         let proc_resp = admin_ref
             .resolve(&client, proc_child_ref.clone())
@@ -2518,11 +2543,25 @@ mod tests {
             "identity must match the proc ref from the host's children list"
         );
 
-        assert!(
-            matches!(proc_node.properties, NodeProperties::Proc { .. }),
-            "expected NodeProperties::Proc, got {:?}",
-            proc_node.properties
-        );
+        match &proc_node.properties {
+            NodeProperties::Proc {
+                is_system,
+                proc_name,
+                ..
+            } => {
+                assert!(
+                    !is_system,
+                    "proc '{}' should have is_system=false; procs are never system",
+                    proc_name
+                );
+            }
+            other => {
+                panic!(
+                    "expected NodeProperties::Proc with is_system=false, got {:?}",
+                    other
+                );
+            }
+        }
 
         assert_eq!(
             proc_node.parent,
