@@ -7,9 +7,8 @@
  */
 
 import React, { useState, useRef, useCallback, useMemo, useEffect } from "react";
-import { Mesh, Actor, Message } from "../types";
 import { useApi } from "../hooks/useApi";
-import { computeLayout, DagNode, DagGraph, TIER_Y, TIER_LABELS, DagTier } from "../utils/dagLayout";
+import { computeLayout, ApiDagData, DagNode, DagGraph, TIER_Y, TIER_LABELS, DagTier } from "../utils/dagLayout";
 import { DagNodeComponent } from "./DagNode";
 import { DagEdgeComponent } from "./DagEdge";
 import { DagLegend } from "./DagLegend";
@@ -29,12 +28,8 @@ interface Tooltip {
  * computeLayout to assign X/Y positions for SVG rendering.
  */
 export function DagView() {
-  // Fetch all data needed for the graph.
-  const { data: meshes, loading: meshLoading } = useApi<Mesh[]>("/meshes");
-  const { data: actors, loading: aLoading } = useApi<Actor[]>("/actors");
-  const { data: messages, loading: msgLoading } = useApi<Message[]>("/messages");
+  const { data: dagData, loading } = useApi<ApiDagData>("/dag");
 
-  // UI state.
   const [selectedNode, setSelectedNode] = useState<DagNode | null>(null);
   const [tooltip, setTooltip] = useState<Tooltip | null>(null);
   const [viewBox, setViewBox] = useState({ x: 0, y: 0, w: 1300, h: 800 });
@@ -47,32 +42,11 @@ export function DagView() {
     return computeLayout(dagData);
   }, [dagData]);
 
-    const messagePairs: Array<[number, number]> = (messages ?? []).map((m) => [
-      m.from_actor_id,
-      m.to_actor_id,
-    ]);
-
-    // Build actor id -> status map from the list endpoint (which now
-    // includes latest_status via the server-side JOIN in db.py).
-    const actorStatuses: Record<number, string> = {};
-    for (const a of actors) {
-      actorStatuses[a.id] = a.latest_status?.toLowerCase() ?? "unknown";
-    }
-
-    return computeLayout(meshes, actors, actorStatuses, messagePairs);
-  }, [meshes, actors, messages]);
-
-  // Set initial view on first load only — don't reset on data refresh.
   const viewInitialized = useRef(false);
   useEffect(() => {
     if (graph && !viewInitialized.current) {
       viewInitialized.current = true;
-      setViewBox({
-        x: -20,
-        y: -20,
-        w: Math.min(graph.width + 40, 1200),
-        h: graph.height + 40,
-      });
+      setViewBox({ x: -20, y: -20, w: graph.width + 40, h: Math.min(graph.height + 40, 800) });
     }
   }, [graph]);
 
@@ -148,8 +122,6 @@ export function DagView() {
 
   const hierEdges = graph.edges.filter((e) => e.type === "hierarchy");
   const msgEdges = graph.edges.filter((e) => e.type === "message");
-
-  // Tier labels for the 6 rows.
   const tierEntries = Object.entries(TIER_LABELS) as Array<[DagTier, string]>;
 
   return (
@@ -175,31 +147,9 @@ export function DagView() {
               <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
             </filter>
           </defs>
-
-          {/* Background grid */}
-          <rect
-            x={viewBox.x - 1000}
-            y={viewBox.y - 1000}
-            width={viewBox.w + 2000}
-            height={viewBox.h + 2000}
-            fill="url(#dag-grid)"
-          />
-
-          {/* Tier labels — left margin, aligned with tier rows */}
+          <rect x={viewBox.x - 1000} y={viewBox.y - 1000} width={viewBox.w + 2000} height={viewBox.h + 2000} fill="url(#dag-grid)" />
           {tierEntries.map(([tier, label]) => (
-            <text
-              key={tier}
-              x={15}
-              y={TIER_Y[tier]}
-              textAnchor="start"
-              dominantBaseline="middle"
-              fill="var(--text-muted)"
-              fontSize="10"
-              fontFamily="var(--font-display)"
-              opacity="0.5"
-            >
-              {label}
-            </text>
+            <text key={tier} x={15} y={TIER_Y[tier]} textAnchor="start" dominantBaseline="middle" fill="var(--text-muted)" fontSize="10" fontFamily="var(--font-display)" opacity="0.5">{label}</text>
           ))}
           <g className="dag-edges-hierarchy">{hierEdges.map((e) => <DagEdgeComponent key={e.id} edge={e} nodes={nodeMap} />)}</g>
           <g className="dag-edges-messages">{msgEdges.map((e) => <DagEdgeComponent key={e.id} edge={e} nodes={nodeMap} />)}</g>
