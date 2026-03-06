@@ -30,6 +30,7 @@ const MESH_COLUMNS = [
 
 const AGENT_COLUMNS = [
   { key: "full_name", label: "Name" },
+  { key: "mesh_class", label: "Class" },
   { key: "rank", label: "Rank" },
   { key: "latest_status", label: "Status" },
 ];

@@ -105,8 +105,7 @@ function renderCell(key: string, entity: any): React.ReactNode {
     case "given_name":
     case "name":
     case "hostname":
-    case "mesh_name":
-      return val ?? "\u2014";
+      return val;
     case "mesh_class":
       return val ?? "\u2014";
     case "full_name":
