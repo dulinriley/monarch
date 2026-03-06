@@ -222,23 +222,25 @@ function TimelineBar({
   const duration = timeline.end_us - timeline.start_us;
 
   // Collect error events with their position on the timeline.
-  const toNotch = (a: { full_name: string; timestamp_us: number }, status: string) => {
-    const name = a.full_name.split("/").pop() ?? "actor";
-    return {
-      pct: ((a.timestamp_us - timeline.start_us) / duration) * 100,
-      status,
-      name,
-      shortName: notchLabel(name),
-      timestamp_us: a.timestamp_us,
-    };
-  };
-
-  const notches = duration > 0
-    ? [
-        ...errors.failed_actors.map((a) => toNotch(a, "failed")),
-        ...errors.stopped_actors.map((a) => toNotch(a, "stopped")),
-      ]
-    : [];
+  const notches: Array<{ pct: number; status: string; name: string; timestamp_us: number }> = [];
+  if (duration > 0) {
+    for (const a of errors.failed_actors) {
+      notches.push({
+        pct: ((a.timestamp_us - timeline.start_us) / duration) * 100,
+        status: "failed",
+        name: a.full_name.split("/").pop() ?? "actor",
+        timestamp_us: a.timestamp_us,
+      });
+    }
+    for (const a of errors.stopped_actors) {
+      notches.push({
+        pct: ((a.timestamp_us - timeline.start_us) / duration) * 100,
+        status: "stopped",
+        name: a.full_name.split("/").pop() ?? "actor",
+        timestamp_us: a.timestamp_us,
+      });
+    }
+  }
 
   return (
     <div className="summary-section" data-testid="timeline-bar">
@@ -260,11 +262,8 @@ function TimelineBar({
             key={`${n.status}-${i}`}
             className={`summary-timeline-notch summary-timeline-notch-${n.status}`}
             style={{ left: `${Math.min(Math.max(n.pct, 0.5), 99.5)}%` }}
-          >
-            <span className="summary-timeline-notch-label">
-              {n.shortName} {n.status}
-            </span>
-          </div>
+            title={`${n.name} ${n.status} at ${formatTimestamp(n.timestamp_us)}`}
+          />
         ))}
       </div>
 
