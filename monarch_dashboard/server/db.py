@@ -346,7 +346,7 @@ def get_dag_data() -> dict[str, Any]:
                     "id": f"host_unit-{agent['id']}",
                     "entity_id": agent["id"],
                     "tier": "host_unit",
-                    "label": _short(agent["full_name"]),
+                    "label": _short(hm["given_name"]).replace("_mesh", ""),
                     "subtitle": "Host",
                     "status": actor_statuses.get(agent["id"], "unknown"),
                 }
@@ -374,7 +374,7 @@ def get_dag_data() -> dict[str, Any]:
                     "id": f"proc_unit-{agent['id']}",
                     "entity_id": agent["id"],
                     "tier": "proc_unit",
-                    "label": _short(agent["full_name"]),
+                    "label": _short(pm["given_name"]).replace("_mesh", ""),
                     "subtitle": "Proc",
                     "status": t_host if t_host else own,
                 }
