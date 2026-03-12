@@ -1,0 +1,60 @@
+name: Test CPU ARM64 Rust
+
+on:
+  workflow_call:
+    inputs:
+      artifact-name:
+        description: 'Wheel artifact name from build workflow'
+        required: true
+        type: string
+
+concurrency:
+  group: test-cpu-arm64-rust-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-cpu-arm64-rust:
+    name: Test CPU ARM64 Rust
+    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+    with:
+      timeout: 120
+      runner: linux.arm64.2xlarge
+      docker-image: pytorch/manylinuxaarch64-builder:cuda12.8
+      submodules: recursive
+      download-artifact: ${{ inputs.artifact-name }}
+      script: |
+        # Source common setup functions
+        source scripts/common-setup.sh
+
+        # Setup test environment
+        setup_test_environment
+
+        # Install Rust
+        setup_rust_toolchain
+
+        # Install System dependencies
+        install_system_dependencies
+
+        # Install PyTorch (needed for ABI compatibility, no GPU required)
+        pip install --pre torch --extra-index-url https://download.pytorch.org/whl/nightly/cu128
+
+        # Run CPU-safe Rust tests (no GPU hardware available)
+        echo "Running ARM64 CPU Rust tests..."
+        # Exclude crates that require GPU hardware, CUDA libraries, or
+        # torch C++ headers (libtorch) not available on CPU-only runners.
+        timeout 12m cargo nextest run --workspace --profile ci \
+          --exclude monarch_messages \
+          --exclude monarch_tensor_worker \
+          --exclude torch-sys-cuda \
+          --exclude monarch_rdma \
+          --exclude torch-sys \
+          --exclude nccl-sys \
+          --exclude rdmaxcel-sys \
+          --exclude monarch_cpp_static_libs \
+          --exclude monarch_extension \
+          --exclude monarch_bench \
+          --exclude monarch_conda
+
+        echo "=== sccache stats ==="
+        sccache --show-stats
+        echo "=== end sccache stats ==="
