@@ -1516,7 +1516,7 @@ class Actor(MeshTrait):
         return False
 
     def __supervise__(self, failure: MeshFailure) -> bool:
-        """Called when the actor is stopped due to a failure in a resource that it
+        """Called when the actor observes a failure in a resource that it
         owns. A resource is a host, proc, actor, or meshes of these.
         If a truthy value is returned, the failure is considered handled and will not
         propagate any further. If a falsey value is returned, the failure will be
@@ -1534,14 +1534,35 @@ class Actor(MeshTrait):
         """
         return False
 
-    # This method can be sync or async, and thus there is no way to have a common
-    # super implementation.
-    # def __cleanup__(self, exc: str | Exception | None) -> None:
-    #     """Runs any cleanup of resources that should happen when the Actor is stopped or fails.
-    #     This is called even if there is an error.
-    #     It is *not* called in cases of fatal errors, which include (but are not limited to):
-    #     OOMs, panics, signals like SIGSEGV, etc."""
-    #     pass
+    def __cleanup__(self, exc: str | Exception | None) -> None:
+        """Called when the actor stops, normally (via ``ActorMesh.stop()``) or
+        because of an error. The same ``__cleanup__`` runs in both cases;
+        ``exc`` is ``None`` on a normal stop and carries the exception on an
+        error stop. It is *not* called on fatal failures such as OOMs, panics,
+        or signals like ``SIGSEGV``. If it exceeds ``HYPERACTOR_CLEANUP_TIMEOUT``,
+        it is cancelled and the actor is placed in an error state.
+
+        By the time this runs, every mesh this actor owns has already been
+        stopped recursively, and each owned actor's ``__cleanup__`` has already
+        run. Owned actor meshes and proc meshes are no longer usable from this
+        method. For shutdown work that needs an owned mesh, expose a dedicated
+        endpoint and call it before ``stop()``.
+
+        Use ``__cleanup__`` to release resources the actor owns directly: open
+        files, network connections, background threads, asyncio tasks, and the
+        like -- not other actors or procs.
+
+        Overrides may be declared with either ``def`` or ``async def``; the
+        async-ness must match the actor's endpoints. Actors with sync endpoints
+        require a sync ``__cleanup__``; actors with async endpoints require an
+        async ``__cleanup__``. An ``async def`` override is awaited on the
+        actor's asyncio event loop -- the same loop that runs endpoint
+        coroutines -- so it can ``await`` other endpoints or I/O. A sync
+        override runs under ``fake_sync_state`` and cannot call
+        ``asyncio.get_running_loop``. If the override raises, the exception
+        becomes a supervision event and will notify the owner.
+        """
+        pass
 
 
 class ActorMesh(MeshTrait, Generic[T]):
