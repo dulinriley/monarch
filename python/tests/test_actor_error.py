@@ -12,6 +12,7 @@ import datetime
 import importlib.resources
 import multiprocessing
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -38,6 +39,13 @@ from monarch.actor import (
     MeshFailure,
 )
 from monarch.config import configured, parametrize_config
+
+
+_IS_MACOS_ARM64 = sys.platform == "darwin" and platform.machine() == "arm64"
+_MACOS_ARM64_CPU_CI_SKIP = pytest.mark.skipif(
+    _IS_MACOS_ARM64,
+    reason="unsupported or flaky on macOS arm64 CPU CI",
+)
 
 
 class ExceptionActor(Actor):
@@ -1835,6 +1843,7 @@ def set_environment(**kwargs: str) -> Generator[None, None, None]:
         os.environ.update(old)
 
 
+@_MACOS_ARM64_CPU_CI_SKIP
 @pytest.mark.timeout(120)
 @isolate_in_subprocess
 def test_client_hard_exit_cleanup() -> None:

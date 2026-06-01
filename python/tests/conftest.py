@@ -27,7 +27,9 @@ if sys.platform != "linux":
         for name in [
             "test_remotemount.py",
             "test_rdma.py",
+            "test_rdma_action.py",
             "test_rdma_cpu_no_torch.py",
+            "test_rdma_lru_cache.py",
             "test_rdma_unit.py",
             "rdma_load_test.py",
         ]

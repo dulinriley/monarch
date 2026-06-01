@@ -8,6 +8,7 @@
 import asyncio
 import importlib.resources
 import os
+import platform
 import re
 import shutil
 import signal
@@ -54,6 +55,13 @@ from monarch.tools.debug_env import (
 )
 from pyre_extensions import none_throws
 from scoped_state import scoped_state
+
+
+_IS_MACOS_ARM64 = sys.platform == "darwin" and platform.machine() == "arm64"
+_MACOS_ARM64_CPU_CI_SKIP = pytest.mark.skipif(
+    _IS_MACOS_ARM64,
+    reason="unsupported or flaky on macOS arm64 CPU CI",
+)
 
 
 TActor = TypeVar("TActor", bound=Actor)
@@ -338,6 +346,7 @@ async def _test_debug(nested: bool) -> None:
 # We have to run this test in a separate process because there is only one
 # debug controller per process, and we don't want this to interfere with
 # the other tests that access the debug controller.
+@_MACOS_ARM64_CPU_CI_SKIP
 @isolate_in_subprocess(env=debug_env)
 @pytest.mark.timeout(60)
 async def test_debug():
@@ -345,6 +354,7 @@ async def test_debug():
 
 
 # See earlier comment.
+@_MACOS_ARM64_CPU_CI_SKIP
 @isolate_in_subprocess(env=debug_env)
 @pytest.mark.timeout(60)
 async def test_debug_nested():
@@ -352,6 +362,7 @@ async def test_debug_nested():
 
 
 # See earlier comment
+@_MACOS_ARM64_CPU_CI_SKIP
 @isolate_in_subprocess(env=debug_env)
 @pytest.mark.timeout(60)
 async def test_debug_multi_actor() -> None:
@@ -783,6 +794,7 @@ async def test_debug_command_parser_invalid_inputs(invalid_input):
 
 
 # See earlier comment
+@_MACOS_ARM64_CPU_CI_SKIP
 @isolate_in_subprocess(env={"MONARCH_CLI_BIN": cli_bin, **debug_env})
 @pytest.mark.timeout(60)
 async def test_debug_cli():
