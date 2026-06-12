@@ -1211,6 +1211,12 @@ class PortedActor(Actor):
         port.send(3 + b)
 
 
+class FailingPortedActor(Actor):
+    @endpoint(explicit_response_port=True)
+    async def fail(self, port: "Port[None]") -> None:
+        raise ValueError("explicit boom")
+
+
 @pytest.mark.timeout(60)
 @parametrize_config(actor_queue_dispatch={True, False})
 def test_ported_actor():
@@ -1218,6 +1224,21 @@ def test_ported_actor():
     a = proc_mesh.spawn("port_actor", PortedActor)
     assert 5 == a.add.call_one(2).get()
     proc_mesh.stop().get()
+
+
+@pytest.mark.timeout(60)
+@parametrize_config(actor_queue_dispatch={True, False})
+@isolate_in_subprocess
+async def test_ported_actor_exception_is_not_auto_forwarded() -> None:
+    proc_mesh = this_host().spawn_procs(per_host={"gpus": 1})
+    actor = proc_mesh.spawn("failing_port_actor", FailingPortedActor)
+
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(actor.fail.call_one(), timeout=0.2)
+    finally:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await proc_mesh.stop()
 
 
 async def _recv():
