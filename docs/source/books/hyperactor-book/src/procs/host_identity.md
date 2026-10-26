@@ -25,12 +25,13 @@ requiring launchers to distribute it separately.
 
 The Host supplies its immutable service ID to its frontend before listening.
 The advertisement belongs to that listener; other procs with the same label do
-not affect the answer. The existing duplex first-message dispatch gains one case:
+not affect the answer. The first message selects one operation for that duplex connection:
 
 | First message | Behavior |
 | --- | --- |
 | `IdentifyService` | Reply once with the advertised concrete ID (or an explicit unavailable/malformed-request error), then close. No peer is registered. |
 | `AttachRequest` | Existing Gateway attachment handshake and message serving. |
+| `AttachAndIdentify { uid }` | Validate the advertised identity, register the peer, and reply with both its via location and service ID; then serve actor messages. Unavailable identity or duplicate peer registration rejects the attachment. |
 | Ordinary actor envelope | Existing inbound routing, including delivery of that first envelope. |
 
 The identity response is appended to `AttachWire`, preserving the existing wire
@@ -51,12 +52,42 @@ timeout so abandoned replies cannot retain sessions forever. Connected, idle
 attachments retain their existing behavior. Completed connection tasks are reaped;
 failed joins are logged both during normal serving and shutdown.
 
-Clients needing Gateway attachment dial a separate session using `serve_via`.
-This costs another connection setup but keeps discovery independent of attachment
-state, inbound actor traffic, and outbound route publication. The discovery result
-is an identity snapshot: a restart between discovery and attachment leaves the old
-ID stale, never silently redirects it to the replacement. Combined Identify + Attach
-can be added separately if avoiding the extra dial becomes necessary.
+## Optional combined attachment
+
+A caller that needs both discovery and Gateway attachment can avoid redialing:
+
+```rust,ignore
+let (attachment, service_proc) = gateway.serve_via_and_identify(frontend).await?;
+```
+
+This sends a single `AttachAndIdentify { uid }` request and expects one
+`AttachedWithIdentity { location, service_proc }` reply. Failures use the existing
+`Ack(Rejected)` response. An unavailable identity is rejected before registering
+any peer; rejecting a duplicate uid leaves its existing attachment untouched.
+The new success variant is appended after existing `AttachWire` variants. Use
+separate query and attach operations with frontends that do not support the
+combined request.
+
+The combined operation shares the [attachment lifecycle](gateway_connection.md)
+with `serve_via`: serialize attachment attempts, retain interleaved inbound actor
+messages, drain the previous outbound route, then publish the new route. A failed
+or cancelled attempt releases queued sends through the current live fallback.
+There is no arbitrary control plan or repeated-query setup loop. Actor traffic
+may precede the reply because peer registration precedes acceptance, so the shared
+attachment buffer still applies.
+
+Standalone `IdentifyService` remains one-shot and registers no peer. Callers may
+still query first and attach on another connection. Both forms learn a snapshot
+of the Host incarnation; neither silently redirects stale IDs after a restart.
+
+An ordinary duplex client may remain connected indefinitely before sending its
+first message. The server cannot classify that connection as a control exchange
+yet, so it does not impose a setup timeout on the first-message wait. Client
+control deadlines and bounded rejection delivery do not limit ordinary idle
+connections or successfully attached sessions.
+
+This combined operation is an optional feature on top of the independent
+discovery and attachment fixes; neither fix requires it.
 
 ## Supplied IDs and Python bootstrap
 
@@ -70,4 +101,6 @@ Tests cover frontend-specific and concurrent queries, unchanged ordinary traffic
 identify followed by a separate attachment, invalid/unavailable replies, cancellation,
 timeouts, session cleanup, and listener shutdown. Host and Python restart tests
 confirm that a replacement is reachable under its new ID while stale references
-fail. The generic Gateway attachment draining/migration fix is independent.
+fail. Combined-attachment tests run the same saved-forwarder, drain, failure, and
+cancellation regressions through both public APIs, and check malformed requests,
+unavailable identities, duplicate peers, invalid replies, and first-message idleness.

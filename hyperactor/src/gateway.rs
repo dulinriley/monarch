@@ -99,6 +99,14 @@ pub(crate) struct AttachRequest {
 }
 wirevalue::register_type!(AttachRequest);
 
+/// Attach and discover this frontend's service identity in one exchange.
+/// An unavailable identity rejects the request before registering a peer.
+#[derive(Debug, Clone, Serialize, Deserialize, typeuri::Named)]
+pub(crate) struct AttachAndIdentify {
+    pub uid: Uid,
+}
+wirevalue::register_type!(AttachAndIdentify);
+
 /// Session setup request for the concrete service identity advertised by this
 /// frontend. It carries no routing identity and never registers a peer.
 #[derive(Debug, Clone, Serialize, Deserialize, typeuri::Named)]
@@ -137,6 +145,12 @@ pub(crate) enum AttachWire {
     /// Service identity, or an explicit unsupported/malformed-request error.
     /// Append only: the existing Ack and Envelope wire tags are unchanged.
     Identity(Result<ProcId, String>),
+    /// Successful AttachAndIdentify reply. Failures use Ack(Rejected).
+    /// Append only: all existing reply tags remain unchanged.
+    AttachedWithIdentity {
+        location: Location,
+        service_proc: ProcId,
+    },
 }
 wirevalue::register_type!(AttachWire);
 
@@ -149,9 +163,11 @@ impl channel::Rx<MessageEnvelope> for AttachRx {
     async fn recv(&mut self) -> Result<MessageEnvelope, ChannelError> {
         match self.0.recv().await? {
             AttachWire::Envelope(envelope) => Ok(envelope),
-            AttachWire::Ack(_) | AttachWire::Identity(_) => Err(ChannelError::Other(
-                anyhow::anyhow!("unexpected control reply after handshake"),
-            )),
+            AttachWire::Ack(_)
+            | AttachWire::Identity(_)
+            | AttachWire::AttachedWithIdentity { .. } => Err(ChannelError::Other(anyhow::anyhow!(
+                "unexpected control reply after handshake"
+            ))),
         }
     }
 
@@ -853,6 +869,8 @@ impl Gateway {
     ///   remaining traffic from the duplex into this gateway. If the
     ///   peer cannot be registered, it replies with
     ///   [`AttachAck::Rejected`] and closes the connection.
+    /// * an [`AttachAndIdentify`] request also returns the advertised service
+    ///   identity in its attachment reply, or rejects if none is advertised.
     /// * an [`IdentifyService`] request receives an unavailable reply and closes;
     ///   Hosts advertise their service identity through `serve_mux_with_service`.
     /// * a regular [`MessageEnvelope`] enters the inbound branch and
@@ -1058,17 +1076,46 @@ impl Gateway {
     /// default location, while older active locations remain valid. The
     /// newest active `serve_via` supplies the outbound forwarder.
     pub async fn serve_via(&self, addr: ChannelAddr) -> anyhow::Result<GatewayServeHandle> {
-        tokio::time::timeout(ATTACH_HANDSHAKE_TIMEOUT, self.serve_via_inner(addr))
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "attach setup timed out after {:?}",
-                    ATTACH_HANDSHAKE_TIMEOUT
-                )
-            })?
+        Ok(self.serve_via_mode(addr, false).await?.0)
     }
 
-    async fn serve_via_inner(&self, addr: ChannelAddr) -> anyhow::Result<GatewayServeHandle> {
+    /// Attach and learn the frontend's service identity on the same connection.
+    /// Uses the same outbound drain, inbound buffering, and cancellation behavior
+    /// as serve_via; only the request and successful reply differ.
+    pub async fn serve_via_and_identify(
+        &self,
+        addr: ChannelAddr,
+    ) -> anyhow::Result<(GatewayServeHandle, ProcId)> {
+        let (handle, identity) = self.serve_via_mode(addr, true).await?;
+        Ok((
+            handle,
+            identity.expect("combined attachment includes identity"),
+        ))
+    }
+
+    async fn serve_via_mode(
+        &self,
+        addr: ChannelAddr,
+        identify: bool,
+    ) -> anyhow::Result<(GatewayServeHandle, Option<ProcId>)> {
+        tokio::time::timeout(
+            ATTACH_HANDSHAKE_TIMEOUT,
+            self.serve_via_inner(addr, identify),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "attach setup timed out after {:?}",
+                ATTACH_HANDSHAKE_TIMEOUT
+            )
+        })?
+    }
+
+    async fn serve_via_inner(
+        &self,
+        addr: ChannelAddr,
+        identify: bool,
+    ) -> anyhow::Result<(GatewayServeHandle, Option<ProcId>)> {
         let _serial = self.inner.attach_serial.lock().await;
         let mut duplex_client = channel::duplex::dial::<MessageEnvelope, AttachWire>(addr)?;
         // DuplexClient intentionally detaches on drop. Setup has scoped ownership
@@ -1076,23 +1123,36 @@ impl Gateway {
         let cleanup = duplex_client.cancellation_token().drop_guard();
         let duplex_tx = duplex_client.tx();
         let mut duplex_rx = duplex_client.take_rx().expect("fresh duplex receiver");
-        duplex_tx.post(build_control_envelope(&AttachRequest {
-            uid: self.uid().clone(),
-        })?);
+        let uid = self.uid().clone();
+        duplex_tx.post(if identify {
+            build_control_envelope(&AttachAndIdentify { uid })?
+        } else {
+            build_control_envelope(&AttachRequest { uid })?
+        });
         let mut inbox = SetupInbox {
             gateway: self.clone(),
             pending: VecDeque::new(),
         };
-        let location = loop {
+        let (location, identity) = loop {
             match duplex_rx.recv().await? {
-                AttachWire::Ack(AttachAck::Accepted { location }) => break location,
+                AttachWire::Ack(AttachAck::Accepted { location }) if !identify => {
+                    break (location, None);
+                }
+                AttachWire::AttachedWithIdentity {
+                    location,
+                    service_proc,
+                } if identify => {
+                    anyhow::ensure!(
+                        service_proc.uid().is_instance(),
+                        "service identity must be an instance id"
+                    );
+                    break (location, Some(service_proc));
+                }
                 AttachWire::Ack(AttachAck::Rejected { reason }) => {
                     anyhow::bail!("attach rejected by peer: {reason}")
                 }
                 AttachWire::Envelope(envelope) => inbox.push(envelope)?,
-                AttachWire::Identity(_) => {
-                    anyhow::bail!("unexpected identity reply during attachment")
-                }
+                _ => anyhow::bail!("unexpected reply kind during attachment"),
             }
         };
 
@@ -1117,15 +1177,18 @@ impl Gateway {
             inner: AttachRx(duplex_rx),
         });
         cleanup.disarm();
-        Ok(GatewayServeHandle {
-            gateway: self.clone(),
-            handle: serve_handle,
-            stopped: false,
-            kind: HandleKind::ServeVia {
-                serve_id: Some(serve_id),
-                duplex_client: Some(duplex_client),
+        Ok((
+            GatewayServeHandle {
+                gateway: self.clone(),
+                handle: serve_handle,
+                stopped: false,
+                kind: HandleKind::ServeVia {
+                    serve_id: Some(serve_id),
+                    duplex_client: Some(duplex_client),
+                },
             },
-        })
+            identity,
+        ))
     }
 
     #[cfg(test)]
@@ -1651,6 +1714,24 @@ async fn duplex_accept_loop(
     duplex_server.join().await;
 }
 
+async fn reject_attach(
+    tx: &channel::duplex::DuplexTx<AttachWire>,
+    reason: String,
+    cancel: &CancellationToken,
+) {
+    tokio::select! {
+        result = tokio::time::timeout(
+            ATTACH_HANDSHAKE_TIMEOUT,
+            tx.send(AttachWire::Ack(AttachAck::Rejected { reason })),
+        ) => {
+            if !matches!(result, Ok(Ok(()))) {
+                tracing::warn!(?result, "failed to deliver attachment rejection");
+            }
+        }
+        () = cancel.cancelled() => {},
+    }
+}
+
 #[cfg(test)]
 struct ActiveDuplexSession(Weak<GatewayState>);
 #[cfg(test)]
@@ -1679,6 +1760,8 @@ async fn serve_duplex_connection(
             .fetch_add(1, AtomicOrdering::Release);
         ActiveDuplexSession(Arc::downgrade(&gateway.inner))
     };
+    // An ordinary duplex client may dial long before its first message. Only
+    // recognized control operations have a deadline; an idle socket is valid.
     let first_msg = tokio::select! {
         result = duplex_rx.recv() => match result {
             Ok(msg) => msg,
@@ -1708,8 +1791,31 @@ async fn serve_duplex_connection(
         return;
     }
 
-    if let Ok(attach_request) = first_msg.deserialized::<AttachRequest>() {
-        let peer_uid = attach_request.uid;
+    let attachment = if first_msg.data().is::<AttachAndIdentify>() {
+        Some(
+            first_msg
+                .deserialized::<AttachAndIdentify>()
+                .map_err(|error| format!("malformed AttachAndIdentify: {error}"))
+                .and_then(|request| {
+                    service_proc
+                        .map(|id| (request.uid, Some(id)))
+                        .ok_or_else(|| "frontend does not advertise a service identity".to_owned())
+                }),
+        )
+    } else {
+        first_msg
+            .deserialized::<AttachRequest>()
+            .ok()
+            .map(|request| Ok((request.uid, None)))
+    };
+    if let Some(attachment) = attachment {
+        let (peer_uid, identity) = match attachment {
+            Ok(attachment) => attachment,
+            Err(reason) => {
+                reject_attach(&duplex_tx, reason, &cancel_token).await;
+                return;
+            }
+        };
         tracing::info!(
             uid = %peer_uid,
             "duplex accepted gateway-attach connection",
@@ -1728,25 +1834,22 @@ async fn serve_duplex_connection(
                     error = %reason,
                     "rejecting gateway-attach connection"
                 );
-                if let Err(send_error) = duplex_tx
-                    .send(AttachWire::Ack(AttachAck::Rejected { reason }))
-                    .await
-                {
-                    tracing::warn!(
-                        uid = %err.uid,
-                        error = %send_error,
-                        "failed to send gateway-attach rejection"
-                    );
-                }
+                reject_attach(&duplex_tx, reason, &cancel_token).await;
                 return;
             }
         };
 
         // Reply with the via location the peer should advertise.
         let via_location = gateway.default_location().with_via(peer_uid);
-        duplex_tx.post(AttachWire::Ack(AttachAck::Accepted {
-            location: via_location,
-        }));
+        duplex_tx.post(match identity {
+            Some(service_proc) => AttachWire::AttachedWithIdentity {
+                location: via_location,
+                service_proc,
+            },
+            None => AttachWire::Ack(AttachAck::Accepted {
+                location: via_location,
+            }),
+        });
 
         let mut handle = gateway.serve_rx(duplex_rx);
         tokio::select! {
@@ -1967,10 +2070,194 @@ mod tests {
         }
     }
 
+    async fn attach_in_mode(
+        gateway: &Gateway,
+        addr: ChannelAddr,
+        expected_identity: Option<ProcId>,
+    ) -> anyhow::Result<GatewayServeHandle> {
+        if let Some(expected) = expected_identity {
+            let (handle, identity) = gateway.serve_via_and_identify(addr).await?;
+            assert_eq!(identity, expected);
+            Ok(handle)
+        } else {
+            gateway.serve_via(addr).await
+        }
+    }
+
+    #[async_timed_test(timeout_secs = 30)]
+    async fn test_attach_and_identify_rejection_does_not_register_or_replace_peer() {
+        for case in ["unavailable", "malformed", "duplicate"] {
+            let server = Gateway::isolated();
+            let identity =
+                (case != "unavailable").then(|| ProcId::instance(Label::strip("service")));
+            let mut listener = server
+                .serve_mux_with_service(ChannelAddr::any(ChannelTransport::Unix), None, identity)
+                .unwrap();
+            let uid = Uid::anonymous();
+            let (messages, _received) = mpsc::unbounded_channel();
+            let existing = if case == "duplicate" {
+                Some(
+                    server
+                        .attach_peer(
+                            uid.clone(),
+                            BoxedMailboxSender::new(RecordingSender(messages)),
+                        )
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let mut client = channel::duplex::dial::<MessageEnvelope, AttachWire>(
+                server.default_location().addr().clone(),
+            )
+            .unwrap();
+            let mut rx = client.take_rx().unwrap();
+            let mut request =
+                build_control_envelope(&AttachAndIdentify { uid: uid.clone() }).unwrap();
+            if case == "malformed" {
+                request = MessageEnvelope::new(
+                    request.sender().clone(),
+                    request.dest().clone(),
+                    wirevalue::Any::serialize_with_encoding_as::<AttachAndIdentify, _>(
+                        wirevalue::Encoding::Json,
+                        &42u64,
+                    )
+                    .unwrap(),
+                    Flattrs::new(),
+                );
+            }
+            client.tx().post(request);
+            match rx.recv().await.unwrap() {
+                AttachWire::Ack(AttachAck::Rejected { reason }) => {
+                    assert!(
+                        reason.contains(match case {
+                            "unavailable" => "does not advertise",
+                            "malformed" => "malformed",
+                            _ => "already has a via peer",
+                        }),
+                        "{reason}"
+                    );
+                }
+                other => panic!("expected rejection, got {other:?}"),
+            }
+            assert!(matches!(rx.recv().await, Err(ChannelError::Closed)));
+            assert_eq!(
+                server.inner.peers.read().unwrap().len(),
+                usize::from(existing.is_some())
+            );
+            if existing.is_some() {
+                assert!(server.inner.peers.read().unwrap().contains_key(&uid));
+            }
+            client.join().await;
+            listener.stop("test complete");
+            listener.join().await.unwrap();
+        }
+    }
+
+    #[async_timed_test(timeout_secs = 30)]
+    async fn test_attach_and_identify_rejects_wrong_or_singleton_reply() {
+        for reply in [
+            AttachWire::Ack(AttachAck::Accepted {
+                location: ChannelAddr::Local(2).into(),
+            }),
+            AttachWire::Identity(Ok(ProcId::instance(Label::strip("service")))),
+            AttachWire::AttachedWithIdentity {
+                location: ChannelAddr::Local(2).into(),
+                service_proc: ProcId::singleton(Label::strip("service")),
+            },
+        ] {
+            let mut server = channel::duplex::serve::<MessageEnvelope, AttachWire>(
+                ChannelAddr::any(ChannelTransport::Unix),
+                None,
+            )
+            .unwrap();
+            let caller = Gateway::isolated();
+            let before = caller.default_location();
+            let query = tokio::spawn({
+                let caller = caller.clone();
+                let addr = server.addr().clone();
+                async move { caller.serve_via_and_identify(addr).await }
+            });
+            let (mut rx, tx) = server.accept().await.unwrap();
+            assert!(rx.recv().await.unwrap().data().is::<AttachAndIdentify>());
+            tx.post(reply);
+            assert!(query.await.unwrap().is_err());
+            assert_eq!(caller.default_location(), before);
+            assert!(
+                caller
+                    .inner
+                    .routing
+                    .read()
+                    .unwrap()
+                    .state
+                    .active_serves
+                    .is_empty()
+            );
+            assert!(matches!(rx.recv().await, Err(ChannelError::Closed)));
+            server.stop("test complete");
+            server.join().await;
+        }
+    }
+
+    #[async_timed_test(timeout_secs = 45)]
+    async fn test_duplex_can_remain_idle_before_first_ordinary_message() {
+        let server = Gateway::isolated();
+        let mut listener = server
+            .serve_duplex(ChannelAddr::any(ChannelTransport::Unix))
+            .unwrap();
+        let proc = Proc::builder()
+            .shared_gateway(server.clone())
+            .build()
+            .unwrap();
+        let recv = proc.client("receiver");
+        let (port, mut received) = recv.bind_handler_port::<u64>();
+        let client = channel::duplex::dial::<MessageEnvelope, AttachWire>(
+            server.default_location().addr().clone(),
+        )
+        .unwrap();
+        while server
+            .inner
+            .active_duplex_sessions
+            .load(AtomicOrdering::Acquire)
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+        // Use wall time: paused time can race real socket I/O. No first message
+        // has identified this connection as a control exchange at this point.
+        tokio::time::sleep(ATTACH_HANDSHAKE_TIMEOUT + Duration::from_millis(100)).await;
+        client.tx().post(
+            MessageEnvelope::serialize(
+                test_actor_id("idle", "sender"),
+                port.bind().port_addr().clone(),
+                &7u64,
+                Flattrs::new(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), received.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            7
+        );
+        assert!(server.inner.peers.read().unwrap().is_empty());
+        client.join().await;
+        listener.stop("test complete");
+        listener.join().await.unwrap();
+    }
+
     /// The old sender is deliberately held at its terminal-completion barrier.
     /// Sends via retained Gateway and Proc handles must wait behind that barrier.
     #[tokio::test]
     async fn test_attach_cutover_drains_and_migrates_saved_forwarders() {
+        for identify in [false, true] {
+            attach_cutover_drains_and_migrates_saved_forwarders(identify).await;
+        }
+    }
+
+    async fn attach_cutover_drains_and_migrates_saved_forwarders(identify: bool) {
         #[derive(Clone)]
         struct HeldFlush {
             messages: mpsc::UnboundedSender<MessageEnvelope>,
@@ -1993,8 +2280,13 @@ mod tests {
             }
         }
         let server = Gateway::isolated();
+        let service_id = ProcId::instance(Label::strip("service"));
         let mut listener = server
-            .serve_duplex(ChannelAddr::any(ChannelTransport::Unix))
+            .serve_mux_with_service(
+                ChannelAddr::any(ChannelTransport::Unix),
+                None,
+                Some(service_id.clone()),
+            )
             .unwrap();
         let proc = Proc::builder()
             .shared_gateway(server.clone())
@@ -2043,7 +2335,8 @@ mod tests {
         let mut attachment = tokio::spawn({
             let client = client.clone();
             let addr = server.default_location().addr().clone();
-            async move { client.serve_via(addr).await }
+            let expected = identify.then_some(service_id.clone());
+            async move { attach_in_mode(&client, addr, expected).await }
         });
         entered.acquire().await.unwrap().forget();
         assert_eq!(client.default_location(), before);
@@ -2263,10 +2556,21 @@ mod tests {
 
     #[async_timed_test(timeout_secs = 30)]
     async fn test_attach_abort_and_failed_drain_reopen_live_route_and_remove_peer() {
+        for identify in [false, true] {
+            attach_abort_and_failed_drain_reopen_live_route_and_remove_peer(identify).await;
+        }
+    }
+
+    async fn attach_abort_and_failed_drain_reopen_live_route_and_remove_peer(identify: bool) {
         for cancel in [true, false] {
             let server = Gateway::isolated();
+            let service_id = ProcId::instance(Label::strip("service"));
             let mut listener = server
-                .serve_duplex(ChannelAddr::any(ChannelTransport::Unix))
+                .serve_mux_with_service(
+                    ChannelAddr::any(ChannelTransport::Unix),
+                    None,
+                    Some(service_id.clone()),
+                )
                 .unwrap();
             let (messages, mut old) = mpsc::unbounded_channel();
             let entered = Arc::new(tokio::sync::Semaphore::new(0));
@@ -2284,7 +2588,8 @@ mod tests {
             let task = tokio::spawn({
                 let gateway = gateway.clone();
                 let addr = server.default_location().addr().clone();
-                async move { gateway.serve_via(addr).await }
+                let expected = identify.then_some(service_id.clone());
+                async move { attach_in_mode(&gateway, addr, expected).await }
             });
             entered.acquire().await.unwrap().forget();
             assert!(
@@ -2339,13 +2644,22 @@ mod tests {
     }
 
     #[async_timed_test(timeout_secs = 30)]
-    async fn test_cancelled_attach_delivers_buffered_inbound_prefix_once_in_order() {
+    async fn test_attach_preserves_buffered_inbound_prefix_on_success_and_cancellation() {
+        for identify in [false, true] {
+            for cancel in [false, true] {
+                attach_preserves_buffered_inbound_prefix(identify, cancel).await;
+            }
+        }
+    }
+
+    async fn attach_preserves_buffered_inbound_prefix(identify: bool, cancel: bool) {
         let mut server = channel::duplex::serve::<MessageEnvelope, AttachWire>(
             ChannelAddr::any(ChannelTransport::Unix),
             None,
         )
         .unwrap();
         let addr = server.addr().clone();
+        let service_id = ProcId::instance(Label::strip("service"));
         let (messages, _old) = mpsc::unbounded_channel();
         let entered = Arc::new(tokio::sync::Semaphore::new(0));
         let release = Arc::new(tokio::sync::Semaphore::new(0));
@@ -2354,7 +2668,7 @@ mod tests {
             BoxedMailboxSender::new(ControlledFlush {
                 messages,
                 entered: entered.clone(),
-                release,
+                release: release.clone(),
                 fail: false,
             }),
         );
@@ -2367,10 +2681,16 @@ mod tests {
         let dest = port.bind().port_addr().clone();
         let task = tokio::spawn({
             let gateway = gateway.clone();
-            async move { gateway.serve_via(addr).await }
+            let expected = identify.then_some(service_id.clone());
+            async move { attach_in_mode(&gateway, addr, expected).await }
         });
         let (mut rx, tx) = server.accept().await.unwrap();
-        assert!(rx.recv().await.unwrap().data().is::<AttachRequest>());
+        let request = rx.recv().await.unwrap();
+        assert!(if identify {
+            request.data().is::<AttachAndIdentify>()
+        } else {
+            request.data().is::<AttachRequest>()
+        });
         for value in 1..=2u64 {
             tx.post(AttachWire::Envelope(
                 MessageEnvelope::serialize(
@@ -2382,15 +2702,53 @@ mod tests {
                 .unwrap(),
             ));
         }
-        tx.post(AttachWire::Ack(AttachAck::Accepted {
-            location: ChannelAddr::Local(2).into(),
-        }));
+        let location = ChannelAddr::Local(2).into();
+        tx.post(if identify {
+            AttachWire::AttachedWithIdentity {
+                location,
+                service_proc: service_id,
+            }
+        } else {
+            AttachWire::Ack(AttachAck::Accepted { location })
+        });
         entered.acquire().await.unwrap().forget();
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
+        // Send a third envelope while the old route's drain remains blocked.
+        // The pre-reply prefix must stay first.
+        if !cancel {
+            tx.send(AttachWire::Envelope(
+                MessageEnvelope::serialize(
+                    test_actor_id("early", "sender"),
+                    dest,
+                    &3u64,
+                    Flattrs::new(),
+                )
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        }
+        // Cancellation coverage below only relies on the consumed pre-reply
+        // prefix; successful attachment must also deliver traffic during drain.
+        let mut via = if cancel {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            None
+        } else {
+            release.add_permits(1);
+            Some(task.await.unwrap().unwrap())
+        };
         assert_eq!(received.recv().await.unwrap(), 1);
         assert_eq!(received.recv().await.unwrap(), 2);
+        if !cancel {
+            assert_eq!(received.recv().await.unwrap(), 3);
+        }
         assert!(received.try_recv().unwrap().is_none());
+        if let Some(handle) = via.as_mut() {
+            handle.stop("test complete");
+        }
+        if let Some(handle) = via {
+            handle.join().await.unwrap();
+        }
         server.stop("test complete");
         server.join().await;
     }
