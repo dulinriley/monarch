@@ -186,8 +186,13 @@ impl<Out: RemoteMessage, In: RemoteMessage> DuplexClient<Out, In> {
         &self.addr
     }
 
-    /// Cancellation owner for a scoped session, such as a service identity query.
-    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+    /// Signal this session to stop without changing detach-on-drop ownership.
+    pub fn stop(&self) {
+        self.cancel_token.cancel();
+    }
+
+    /// A cancellation owner for setup and other scoped session users.
+    pub fn cancellation_token(&self) -> CancellationToken {
         self.cancel_token.clone()
     }
 
@@ -488,7 +493,14 @@ pub(super) async fn dispatch_duplex_stream<In: RemoteMessage, Out: RemoteMessage
         addr: addr.clone(),
         status,
     };
-    let _ = accept_tx.send((net_rx, net_tx)).await;
+    let accepted = tokio::select! {
+        result = accept_tx.send((net_rx, net_tx)) => result.is_ok(),
+        () = cancel.cancelled() => false,
+    };
+    if !accepted {
+        sessions.remove(&session_id);
+        return;
+    }
 
     // Hand the first connection off through the channel; the loop
     // below picks it up via `session.connect().await`.
@@ -506,15 +518,15 @@ pub(super) async fn dispatch_duplex_stream<In: RemoteMessage, Out: RemoteMessage
     let log_id = format!("duplex server {:016x}", session_id.0);
     let mut deliveries = session::Deliveries {
         outbox: session::Outbox::new(log_id.clone(), dest.clone(), session_id.0),
-        unacked: session::Unacked::new(None, log_id),
+        unacked: session::Unacked::new(None, log_id.clone()),
     };
     let mut session = Session::new(link);
     let mut recv_next = Next { seq: 0, ack: 0 };
 
     loop {
-        // A one-shot query can disappear while its reply is being sent.
-        // Bound disconnected sessions so they cannot retain that reply forever;
-        // this does not impose a deadline on connected, idle attachments.
+        // Connected attached sessions can be idle indefinitely. Only bound
+        // the disconnected reconnect wait so a cancelled/crashed initiator
+        // cannot retain its application receiver and peer guard forever.
         let reconnect_timeout =
             hyperactor_config::global::get(crate::config::MESSAGE_DELIVERY_TIMEOUT);
         let connected = match tokio::time::timeout(reconnect_timeout, session.connect()).await {
@@ -639,11 +651,47 @@ pub(super) async fn dispatch_duplex_stream<In: RemoteMessage, Out: RemoteMessage
     // reconnect for the same session_id starts a fresh dispatch task
     // instead of feeding a dead channel; any in-flight feeder's send
     // fails after the link's receiver above is dropped.
+    reject_pending(
+        &mut deliveries,
+        &mut outbound_rx,
+        &CloseReason::ServerClosed("duplex session ended".into()),
+    );
     sessions.remove(&session_id);
 
     let _ = notify.send(TxStatus::Closed(CloseReason::Other(
         "duplex session ended".into(),
     )));
+}
+
+/// Settle every accepted send before the session task exits. In particular, a
+/// dropped completion sink does not resolve a MailboxClient's flush counter.
+fn reject_pending<M: RemoteMessage>(
+    deliveries: &mut session::Deliveries<M>,
+    receiver: &mut mpsc::UnboundedReceiver<(M, CompletionSink<M>, Instant)>,
+    reason: &CloseReason,
+) {
+    receiver.close();
+    let current = Some(reason.send_error_reason());
+    let earlier = Some(crate::channel::SendErrorReason::Other(reason.to_string()));
+    for queued in deliveries
+        .unacked
+        .deque
+        .drain(..)
+        .chain(deliveries.outbox.deque.drain(..))
+    {
+        let reason = match queued.written {
+            session::Written::Earlier => earlier.clone(),
+            session::Written::Never | session::Written::Current => current.clone(),
+        };
+        queued.try_return(reason);
+    }
+    while let Ok((message, completion, _)) = receiver.try_recv() {
+        completion.reject(SendError {
+            error: ChannelError::Closed,
+            message,
+            reason: current.clone(),
+        });
+    }
 }
 
 /// Establish a duplex (bidirectional) session over the given link.
@@ -668,7 +716,7 @@ pub(crate) fn spawn<Out: RemoteMessage, In: RemoteMessage>(
         let log_id = format!("session {}.{:016x}", dest, session_id.0);
         let mut deliveries = session::Deliveries {
             outbox: session::Outbox::new(log_id.clone(), dest.clone(), session_id.0),
-            unacked: session::Unacked::new(None, log_id),
+            unacked: session::Unacked::new(None, log_id.clone()),
         };
         let mut outbound_rx = outbound_rx;
         let mut recv_next = Next { seq: 0, ack: 0 };
@@ -681,6 +729,7 @@ pub(crate) fn spawn<Out: RemoteMessage, In: RemoteMessage>(
             .build();
 
         let mut link_status = LinkStatus::NeverConnected;
+        let mut close_reason = CloseReason::ServerClosed("duplex session ended".into());
 
         loop {
             // Race connect against cancel so a `DuplexClient::stop`
@@ -748,12 +797,18 @@ pub(crate) fn spawn<Out: RemoteMessage, In: RemoteMessage>(
                             delay_ms = delay.as_millis() as u64,
                             "duplex send_connected returned EOF, reconnecting after backoff; {link_status}"
                         );
-                        tokio::time::sleep(delay).await;
+                        tokio::select! {
+                            () = tokio::time::sleep(delay) => {},
+                            () = task_cancel.cancelled() => {},
+                        }
                     }
                     false
                 }
                 Err(Either::Send(e)) => {
                     let terminal = log_send_error(e, &dest, session_id.0, "duplex", &link_status);
+                    if terminal {
+                        close_reason = super::classify_send_loop_error(e, &log_id);
+                    }
                     if !terminal {
                         // Recoverable send error — reconnect after backoff.
                         if let Some(delay) = reconnect_backoff.next_backoff() {
@@ -765,7 +820,10 @@ pub(crate) fn spawn<Out: RemoteMessage, In: RemoteMessage>(
                                 mode = "duplex",
                                 "send error (recoverable), reconnecting after backoff; {link_status}",
                             );
-                            tokio::time::sleep(delay).await;
+                            tokio::select! {
+                            () = tokio::time::sleep(delay) => {},
+                            () = task_cancel.cancelled() => {},
+                        }
                         }
                     }
                     terminal
@@ -780,7 +838,10 @@ pub(crate) fn spawn<Out: RemoteMessage, In: RemoteMessage>(
                             mode = "duplex",
                             "recv error (recoverable), reconnecting after backoff; {link_status}",
                         );
-                        tokio::time::sleep(delay).await;
+                        tokio::select! {
+                            () = tokio::time::sleep(delay) => {},
+                            () = task_cancel.cancelled() => {},
+                        }
                     }
                     metrics::CHANNEL_ERRORS.add(
                         1,
@@ -862,9 +923,8 @@ pub(crate) fn spawn<Out: RemoteMessage, In: RemoteMessage>(
             }
         }
 
-        let _ = notify.send(TxStatus::Closed(CloseReason::Other(
-            "duplex session ended".into(),
-        )));
+        reject_pending(&mut deliveries, &mut outbound_rx, &close_reason);
+        let _ = notify.send(TxStatus::Closed(close_reason));
     });
     let tx = DuplexTx::new(outbound_tx, addr.clone(), status);
     let rx = DuplexRx::new(inbound_rx, addr.clone());
@@ -966,6 +1026,48 @@ mod tests {
         assert_eq!(srx2.recv().await.unwrap(), 300);
         stx2.post(400);
         assert_eq!(rx2.recv().await.unwrap(), 400);
+    }
+
+    #[async_timed_test(timeout_secs = 30)]
+    async fn test_cancel_before_connect_settles_every_pending_send() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = ChannelAddr::Tcp(listener.local_addr().unwrap());
+        // Keep a bound but non-accepting endpoint: setup cannot finish before
+        // cancellation, independent of scheduler or connect timing.
+        let client = dial::<u64, u64>(addr).unwrap();
+        let tx = client.tx();
+        let mut receipts = Vec::new();
+        for value in 0..32 {
+            let (completion, receipt) = CompletionSink::receipt();
+            tx.do_post(value, completion);
+            receipts.push(receipt);
+        }
+        client.stop();
+        client.join().await;
+        for receipt in receipts {
+            assert!(receipt.await.is_err());
+        }
+    }
+
+    #[async_timed_test(timeout_secs = 30)]
+    async fn test_server_stop_settles_pending_acceptor_sends() {
+        let mut server = serve::<u64, u64>(ChannelAddr::any(ChannelTransport::Unix), None).unwrap();
+        let client = dial::<u64, u64>(server.addr().clone()).unwrap();
+        let (_rx, tx) = server.accept().await.unwrap();
+        let mut receipts = Vec::new();
+        // More than the bounded inbound application queue, so not all messages
+        // can receive wire acknowledgments while the client receiver is idle.
+        for value in 0..2048 {
+            let (completion, receipt) = CompletionSink::receipt();
+            tx.do_post(value, completion);
+            receipts.push(receipt);
+        }
+        server.stop("test complete");
+        server.join().await;
+        for receipt in receipts {
+            let _ = receipt.await;
+        }
+        client.join().await;
     }
 
     #[tokio::test]
